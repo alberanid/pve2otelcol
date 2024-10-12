@@ -1,62 +1,42 @@
 package main
 
 import (
-	"context"
-	"log"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	"github.com/alberanid/pve2otelcol/ologgers"
 	otellog "go.opentelemetry.io/otel/log"
-	otelsdklog "go.opentelemetry.io/otel/sdk/log"
-	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 func main() {
-	ctx := context.Background()
-	rpcOptions := []otlploggrpc.Option{
-		otlploggrpc.WithEndpointURL("http://alloy.lan:4317"),
-		otlploggrpc.WithCompressor("gzip"),
-		otlploggrpc.WithReconnectionPeriod(time.Duration(time.Duration(10) * time.Second)),
-		otlploggrpc.WithRetry(otlploggrpc.RetryConfig{
-			Enabled:         true,
-			InitialInterval: time.Duration(2) * time.Second,
-			MaxInterval:     time.Duration(10) * time.Second,
-			MaxElapsedTime:  time.Duration(30) * time.Second,
-		}),
-	}
-	rpc, err := otlploggrpc.New(ctx, rpcOptions...)
-	if err != nil {
-		log.Fatal("gne gne gne")
-	}
-	r := otelsdklog.Record{}
-	r.SetBody(otellog.StringValue("test log"))
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan bool, 1)
+	go func() {
+		sig := <-sigs
+		fmt.Println()
+		fmt.Println(sig)
+		done <- true
+	}()
 
-	records := []otelsdklog.Record{}
-
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("lxc/666"),
-		),
-	)
-
-	bp := otelsdklog.NewBatchProcessor(rpc)
-	provider := otelsdklog.NewLoggerProvider(
-		otelsdklog.WithProcessor(bp),
-		otelsdklog.WithResource(res),
-	)
-	tl := provider.Logger("test logger")
-
+	logger, _ := ologgers.New(ologgers.OLoggerOptions{
+		Endpoint:    "http://alloy.lan:4317",
+		ServiceName: "lxc/666",
+	})
 	olog := otellog.Record{}
-	olog.SetBody(otellog.StringValue("test log 2"))
-	tl.Emit(ctx, olog)
-	provider.ForceFlush(ctx)
+	//strJson := []byte("{\"message\": \"TEST\", \"value\": 42}")
+	//var jData map[string]interface{}
+	//json.Unmarshal(strJson, &jData)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	records = append(records, r)
-	err = rpc.Export(ctx, records)
-	if err != nil {
-		log.Printf("error exporting: %v", err)
-	}
+	olog.SetBody(otellog.StringValue(fmt.Sprintf("test log nr. %d", rnd.Uint32())))
+
+	//olog.SetBody(otellog.MapValue(jData))
+	logger.LogRecord(olog)
+
+	<-done
 }
