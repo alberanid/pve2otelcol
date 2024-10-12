@@ -33,7 +33,18 @@ func main() {
 	//json.Unmarshal(strJson, &jData)
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	olog.SetBody(otellog.StringValue(fmt.Sprintf("test log nr. %d", rnd.Uint32())))
+	//olog.SetBody(otellog.StringValue(fmt.Sprintf("test log nr. %d", rnd.Uint32())))
+	rkv := otellog.MapValue(
+		otellog.KeyValue{
+			Key:   "message",
+			Value: otellog.StringValue(fmt.Sprintf("random test log nr. %d", rnd.Uint32())),
+		},
+		otellog.KeyValue{
+			Key:   "value",
+			Value: otellog.IntValue(42),
+		},
+	)
+	olog.SetBody(rkv)
 
 	//olog.SetBody(otellog.MapValue(jData))
 	logger.LogRecord(olog)
