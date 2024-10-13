@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -33,9 +32,7 @@ func main() {
 	var jData interface{}
 	json.Unmarshal(strJson, &jData)
 	logger.Log(jData)
-	pve.New()
-	for _, lxc := range pve.New().ListLXCs() {
-		log.Printf("ID:%d name:%s running:%t", lxc.Id, lxc.Name, lxc.Running)
-	}
+	p := pve.New()
+	p.RefreshLXCsMonitoring()
 	<-done
 }
