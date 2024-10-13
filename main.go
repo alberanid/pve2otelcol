@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -9,7 +11,7 @@ import (
 	"time"
 
 	"github.com/alberanid/pve2otelcol/ologgers"
-	otellog "go.opentelemetry.io/otel/log"
+	"github.com/alberanid/pve2otelcol/pve"
 )
 
 func main() {
@@ -17,9 +19,7 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	done := make(chan bool, 1)
 	go func() {
-		sig := <-sigs
-		fmt.Println()
-		fmt.Println(sig)
+		<-sigs
 		done <- true
 	}()
 
@@ -27,27 +27,15 @@ func main() {
 		Endpoint:    "http://alloy.lan:4317",
 		ServiceName: "lxc/666",
 	})
-	olog := otellog.Record{}
-	//strJson := []byte("{\"message\": \"TEST\", \"value\": 42}")
-	//var jData map[string]interface{}
-	//json.Unmarshal(strJson, &jData)
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	//olog.SetBody(otellog.StringValue(fmt.Sprintf("test log nr. %d", rnd.Uint32())))
-	rkv := otellog.MapValue(
-		otellog.KeyValue{
-			Key:   "message",
-			Value: otellog.StringValue(fmt.Sprintf("random test log nr. %d", rnd.Uint32())),
-		},
-		otellog.KeyValue{
-			Key:   "value",
-			Value: otellog.IntValue(42),
-		},
-	)
-	olog.SetBody(rkv)
-
-	//olog.SetBody(otellog.MapValue(jData))
-	logger.LogRecord(olog)
-
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano())).Uint32()
+	strJson := []byte(fmt.Sprintf("{\"message\": \"TEST %d\", \"int\": 42, \"null\": null, \"array\": [0, \"a\", 2, 3.14, null]}", rnd))
+	var jData interface{}
+	json.Unmarshal(strJson, &jData)
+	logger.Log(jData)
+	pve.New()
+	for _, lxc := range pve.New().ListLXCs() {
+		log.Printf("ID:%d name:%s running:%t", lxc.Id, lxc.Name, lxc.Running)
+	}
 	<-done
 }
