@@ -17,8 +17,11 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	done := make(chan bool, 1)
+
+	p := pve.New()
 	go func() {
 		<-sigs
+		p.Stop()
 		done <- true
 	}()
 
@@ -32,7 +35,7 @@ func main() {
 	var jData interface{}
 	json.Unmarshal(strJson, &jData)
 	logger.Log(jData)
-	p := pve.New()
-	p.RefreshLXCsMonitoring()
+
+	//p.RefreshLXCsMonitoring()
 	<-done
 }
