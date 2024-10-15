@@ -7,12 +7,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alberanid/pve2otelcol/config"
+	"github.com/alberanid/pve2otelcol/ologgers"
+	"golang.org/x/exp/rand"
 )
 
 type LXC struct {
 	Id      int
 	Name    string
 	Running bool
+	Logger  *ologgers.OLogger
 }
 
 type LXCs map[int]*LXC
@@ -20,14 +25,17 @@ type LXCs map[int]*LXC
 var KnownLXCs = LXCs{}
 
 type Pve struct {
+	cfg                *config.Config
 	UpdateIntervalSecs int
 	ticker             *time.Ticker
 	quitTicker         *chan bool
 }
 
-func New() *Pve {
-	pve := Pve{}
-	pve.UpdateIntervalSecs = 10
+func New(cfg *config.Config) *Pve {
+	pve := Pve{
+		cfg:                cfg,
+		UpdateIntervalSecs: 10,
+	}
 	pve.periodicRefresh()
 	return &pve
 }
@@ -63,6 +71,14 @@ func (p *Pve) CurrentLXCs() LXCs {
 func (p *Pve) AddLXC(l *LXC) *LXC {
 	if _, ok := KnownLXCs[l.Id]; !ok {
 		slog.Info("new, add LXC")
+		logger, err := ologgers.New(ologgers.OLoggerOptions{
+			Endpoint:    p.cfg.OtlpgRPCURL,
+			ServiceName: fmt.Sprintf("lxc/%d", l.Id),
+		})
+		if err != nil {
+			slog.Warn(fmt.Sprintf("unable to create a logger for lxc/%d", l.Id))
+		}
+		l.Logger = logger
 		KnownLXCs[l.Id] = l
 	}
 	return KnownLXCs[l.Id]
@@ -118,6 +134,12 @@ func (p *Pve) RefreshLXCsMonitoring() {
 	}
 	for _, lxc := range remove {
 		p.RemoveLXC(lxc)
+	}
+
+	// XXX: test, remove
+	for id, lxc := range KnownLXCs {
+		rnd := rand.New(rand.NewSource(uint64(time.Now().UnixNano()))).Uint32()
+		lxc.Logger.Log(fmt.Sprintf("id:%d rnd:%d", id, rnd))
 	}
 }
 
