@@ -1,6 +1,8 @@
 package pve
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -14,10 +16,11 @@ import (
 )
 
 type LXC struct {
-	Id      int
-	Name    string
-	Running bool
-	Logger  *ologgers.OLogger
+	Id          int
+	Name        string
+	Running     bool
+	Logger      *ologgers.OLogger
+	StopProcess func()
 }
 
 type LXCs map[int]*LXC
@@ -38,6 +41,31 @@ func New(cfg *config.Config) *Pve {
 	}
 	pve.periodicRefresh()
 	return &pve
+}
+
+func runMonitoringProcess(id int) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	cmdArgs := []string{
+		"exec",
+		fmt.Sprintf("%d", id),
+		"--",
+		"journalctl",
+		"-f",
+		"-o",
+		"json",
+	}
+	cmd := exec.CommandContext(ctx, "pct", cmdArgs...)
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Start()
+	go func() {
+		defer cmd.Wait()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			s := scanner.Text()
+			fmt.Println(s)
+		}
+	}()
+	return cancel
 }
 
 func (p *Pve) CurrentLXCs() LXCs {
@@ -67,6 +95,12 @@ func (p *Pve) CurrentLXCs() LXCs {
 	}
 	return lxcs
 }
+func (p *Pve) GetKnownLXC(l *LXC) *LXC {
+	if knownLXC, ok := KnownLXCs[l.Id]; ok {
+		return knownLXC
+	}
+	return nil
+}
 
 func (p *Pve) AddLXC(l *LXC) *LXC {
 	if _, ok := KnownLXCs[l.Id]; !ok {
@@ -79,6 +113,7 @@ func (p *Pve) AddLXC(l *LXC) *LXC {
 			slog.Warn(fmt.Sprintf("unable to create a logger for lxc/%d", l.Id))
 		}
 		l.Logger = logger
+		l.StopProcess = runMonitoringProcess(l.Id)
 		KnownLXCs[l.Id] = l
 	}
 	return KnownLXCs[l.Id]
@@ -89,14 +124,19 @@ func (p *Pve) StartLXCMonitoring(l *LXC) {
 	lxc := p.AddLXC(l)
 	lxc.Running = true
 }
+
 func (p *Pve) StopLXCMonitoring(l *LXC) {
 	slog.Info("from running to stopped: stop monitoring")
 	lxc := p.AddLXC(l)
+	if l.StopProcess != nil {
+		l.StopProcess()
+	}
 	lxc.Running = false
 }
 
 func (p *Pve) RemoveLXC(l *LXC) {
 	slog.Info(fmt.Sprintf("remove LXC %d", l.Id))
+	p.StopLXCMonitoring(l)
 	delete(KnownLXCs, l.Id)
 }
 
