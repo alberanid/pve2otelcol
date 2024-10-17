@@ -91,9 +91,8 @@ func (p *Pve) CurrentLXCs() LXCs {
 			continue
 		}
 		lxcs[numId] = &LXC{
-			Id:      numId,
-			Name:    name,
-			Running: state == "running",
+			Id:   numId,
+			Name: name,
 		}
 	}
 	return lxcs
@@ -106,7 +105,7 @@ func (p *Pve) GetKnownLXC(l *LXC) *LXC {
 	return nil
 }
 
-func (p *Pve) AddLXC(l *LXC) *LXC {
+func (p *Pve) UpdateLXC(l *LXC) *LXC {
 	if _, ok := p.knownLXCs[l.Id]; !ok {
 		slog.Info("new, add LXC")
 		logger, err := ologgers.New(ologgers.OLoggerOptions{
@@ -124,60 +123,44 @@ func (p *Pve) AddLXC(l *LXC) *LXC {
 
 func (p *Pve) StartLXCMonitoring(l *LXC) {
 	slog.Info("from stopped to running: start monitoring")
-	lxc := p.AddLXC(l)
-	if lxc.Logger != nil {
+	lxc := p.UpdateLXC(l)
+	if lxc.Logger != nil && !lxc.Running {
 		lxc.StopProcess = runMonitoringProcess(lxc.Id)
 		lxc.Running = true
 	}
 }
 
-func (p *Pve) StopLXCMonitoring(l *LXC) {
+func (p *Pve) StopLXCMonitoring(id int) {
 	slog.Info("from running to stopped: stop monitoring")
-	lxc := p.AddLXC(l)
-	if l.StopProcess != nil {
-		l.StopProcess()
+	if lxc, ok := p.knownLXCs[id]; ok {
+		if lxc.StopProcess != nil {
+			lxc.StopProcess()
+		}
+		lxc.Running = false
 	}
-	lxc.Running = false
 }
 
-func (p *Pve) RemoveLXC(l *LXC) {
-	slog.Info(fmt.Sprintf("remove LXC %d", l.Id))
-	p.StopLXCMonitoring(l)
-	delete(p.knownLXCs, l.Id)
+func (p *Pve) RemoveLXC(id int) {
+	slog.Info(fmt.Sprintf("remove LXC %d", id))
+	p.StopLXCMonitoring(id)
+	delete(p.knownLXCs, id)
 }
 
 func (p *Pve) RefreshLXCsMonitoring() {
 	lxcs := p.CurrentLXCs()
-	for id, lxc := range lxcs {
-		if knownLXC, ok := p.knownLXCs[id]; ok {
-			slog.Debug(fmt.Sprintf("Id %d (%s, running:%t known-running:%t) already known",
-				id, lxc.Name, lxc.Running, knownLXC.Running))
-			if lxc.Running && !knownLXC.Running {
-				p.StartLXCMonitoring(lxc)
-			} else if !lxc.Running && knownLXC.Running {
-				p.RemoveLXC(lxc)
-			}
-		} else {
-			slog.Info(fmt.Sprintf("Id %d (%s, running:%t) not already known", id, lxc.Name, lxc.Running))
-			if lxc.Running {
-				p.StartLXCMonitoring(lxc)
-			}
-		}
+	for _, lxc := range lxcs {
+		p.StartLXCMonitoring(lxc)
 	}
 
-	remove := []*LXC{}
+	remove := []int{}
 	for id, lxc := range p.knownLXCs {
 		if _, ok := lxcs[id]; !ok {
 			slog.Info(fmt.Sprintf("Id %d (%s) vanished", id, lxc.Name))
-			if lxc.Running {
-				slog.Info("stop monitoring")
-			}
-			slog.Info("remove from p.knownLXCs")
-			remove = append(remove, lxc)
+			remove = append(remove, lxc.Id)
 		}
 	}
-	for _, lxc := range remove {
-		p.RemoveLXC(lxc)
+	for _, id := range remove {
+		p.RemoveLXC(id)
 	}
 
 	// XXX: test, remove
@@ -210,10 +193,7 @@ func (p *Pve) periodicRefresh() {
 func (p *Pve) Stop() {
 	p.ticker.Stop()
 	*p.quitTicker <- true
-	for id, lxc := range p.knownLXCs {
-		if !lxc.Running {
-			continue
-		}
-		slog.Info(fmt.Sprintf("stop monitoring lxc/%d (%s)", id, lxc.Name))
+	for id := range p.knownLXCs {
+		p.RemoveLXC(id)
 	}
 }
