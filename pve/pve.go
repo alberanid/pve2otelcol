@@ -43,19 +43,26 @@ func New(cfg *config.Config) *Pve {
 	return &pve
 }
 
-func (p *Pve) RunMonitoringProcess(lxc *LXC) context.CancelFunc {
+func (p *Pve) RunMonitoringProcess(lxc *LXC) error {
 	ctx, cancel := context.WithCancel(context.Background())
+	lxc.StopProcess = cancel
 	cmdArgs := []string{
 		"exec",
 		fmt.Sprintf("%d", lxc.Id),
 		"--",
 		"journalctl",
-		"-f",
-		"-o",
+		"--lines",
+		"0",
+		"--follow",
+		"--output",
 		"json",
 	}
 	cmd := exec.CommandContext(ctx, "pct", cmdArgs...)
-	stdout, _ := cmd.StdoutPipe()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error(fmt.Sprintf("failure opening standard output of lxc/%d: %v", lxc.Id, err))
+		return err
+	}
 	cmd.Start()
 	go func() {
 		defer cmd.Wait()
@@ -71,7 +78,7 @@ func (p *Pve) RunMonitoringProcess(lxc *LXC) context.CancelFunc {
 			}
 		}
 	}()
-	return cancel
+	return nil
 }
 
 func (p *Pve) CurrentLXCs() LXCs {
@@ -104,13 +111,6 @@ func (p *Pve) CurrentLXCs() LXCs {
 	return lxcs
 }
 
-func (p *Pve) GetKnownLXC(l *LXC) *LXC {
-	if knownLXC, ok := p.knownLXCs[l.Id]; ok {
-		return knownLXC
-	}
-	return nil
-}
-
 func (p *Pve) UpdateLXC(l *LXC) *LXC {
 	if _, ok := p.knownLXCs[l.Id]; !ok {
 		slog.Info("new, add LXC")
@@ -130,7 +130,7 @@ func (p *Pve) UpdateLXC(l *LXC) *LXC {
 func (p *Pve) StartLXCMonitoring(l *LXC) {
 	lxc := p.UpdateLXC(l)
 	if lxc.Logger != nil && !lxc.Running {
-		lxc.StopProcess = p.RunMonitoringProcess(lxc)
+		p.RunMonitoringProcess(lxc)
 		lxc.Running = true
 	}
 }
