@@ -25,10 +25,9 @@ type LXC struct {
 
 type LXCs map[int]*LXC
 
-var KnownLXCs = LXCs{}
-
 type Pve struct {
 	cfg                *config.Config
+	knownLXCs          LXCs
 	UpdateIntervalSecs int
 	ticker             *time.Ticker
 	quitTicker         *chan bool
@@ -37,6 +36,7 @@ type Pve struct {
 func New(cfg *config.Config) *Pve {
 	pve := Pve{
 		cfg:                cfg,
+		knownLXCs:          LXCs{},
 		UpdateIntervalSecs: 10,
 	}
 	pve.periodicRefresh()
@@ -83,6 +83,9 @@ func (p *Pve) CurrentLXCs() LXCs {
 		id := items[0]
 		state := items[1]
 		name := items[2]
+		if state != "running" {
+			continue
+		}
 		numId, err := strconv.Atoi(id)
 		if err != nil {
 			continue
@@ -95,15 +98,16 @@ func (p *Pve) CurrentLXCs() LXCs {
 	}
 	return lxcs
 }
+
 func (p *Pve) GetKnownLXC(l *LXC) *LXC {
-	if knownLXC, ok := KnownLXCs[l.Id]; ok {
+	if knownLXC, ok := p.knownLXCs[l.Id]; ok {
 		return knownLXC
 	}
 	return nil
 }
 
 func (p *Pve) AddLXC(l *LXC) *LXC {
-	if _, ok := KnownLXCs[l.Id]; !ok {
+	if _, ok := p.knownLXCs[l.Id]; !ok {
 		slog.Info("new, add LXC")
 		logger, err := ologgers.New(ologgers.OLoggerOptions{
 			Endpoint:    p.cfg.OtlpgRPCURL,
@@ -113,16 +117,18 @@ func (p *Pve) AddLXC(l *LXC) *LXC {
 			slog.Warn(fmt.Sprintf("unable to create a logger for lxc/%d", l.Id))
 		}
 		l.Logger = logger
-		l.StopProcess = runMonitoringProcess(l.Id)
-		KnownLXCs[l.Id] = l
+		p.knownLXCs[l.Id] = l
 	}
-	return KnownLXCs[l.Id]
+	return p.knownLXCs[l.Id]
 }
 
 func (p *Pve) StartLXCMonitoring(l *LXC) {
 	slog.Info("from stopped to running: start monitoring")
 	lxc := p.AddLXC(l)
-	lxc.Running = true
+	if lxc.Logger != nil {
+		lxc.StopProcess = runMonitoringProcess(lxc.Id)
+		lxc.Running = true
+	}
 }
 
 func (p *Pve) StopLXCMonitoring(l *LXC) {
@@ -137,38 +143,36 @@ func (p *Pve) StopLXCMonitoring(l *LXC) {
 func (p *Pve) RemoveLXC(l *LXC) {
 	slog.Info(fmt.Sprintf("remove LXC %d", l.Id))
 	p.StopLXCMonitoring(l)
-	delete(KnownLXCs, l.Id)
+	delete(p.knownLXCs, l.Id)
 }
 
 func (p *Pve) RefreshLXCsMonitoring() {
 	lxcs := p.CurrentLXCs()
 	for id, lxc := range lxcs {
-		if knownLXC, ok := KnownLXCs[id]; ok {
+		if knownLXC, ok := p.knownLXCs[id]; ok {
 			slog.Debug(fmt.Sprintf("Id %d (%s, running:%t known-running:%t) already known",
 				id, lxc.Name, lxc.Running, knownLXC.Running))
 			if lxc.Running && !knownLXC.Running {
 				p.StartLXCMonitoring(lxc)
 			} else if !lxc.Running && knownLXC.Running {
-				p.StopLXCMonitoring(lxc)
+				p.RemoveLXC(lxc)
 			}
 		} else {
 			slog.Info(fmt.Sprintf("Id %d (%s, running:%t) not already known", id, lxc.Name, lxc.Running))
 			if lxc.Running {
 				p.StartLXCMonitoring(lxc)
-			} else {
-				p.AddLXC(lxc)
 			}
 		}
 	}
 
 	remove := []*LXC{}
-	for id, lxc := range KnownLXCs {
+	for id, lxc := range p.knownLXCs {
 		if _, ok := lxcs[id]; !ok {
 			slog.Info(fmt.Sprintf("Id %d (%s) vanished", id, lxc.Name))
 			if lxc.Running {
 				slog.Info("stop monitoring")
 			}
-			slog.Info("remove from KnownLXCs")
+			slog.Info("remove from p.knownLXCs")
 			remove = append(remove, lxc)
 		}
 	}
@@ -177,7 +181,7 @@ func (p *Pve) RefreshLXCsMonitoring() {
 	}
 
 	// XXX: test, remove
-	for id, lxc := range KnownLXCs {
+	for id, lxc := range p.knownLXCs {
 		rnd := rand.New(rand.NewSource(uint64(time.Now().UnixNano()))).Uint32()
 		lxc.Logger.Log(fmt.Sprintf("id:%d rnd:%d", id, rnd))
 	}
@@ -206,7 +210,7 @@ func (p *Pve) periodicRefresh() {
 func (p *Pve) Stop() {
 	p.ticker.Stop()
 	*p.quitTicker <- true
-	for id, lxc := range KnownLXCs {
+	for id, lxc := range p.knownLXCs {
 		if !lxc.Running {
 			continue
 		}
