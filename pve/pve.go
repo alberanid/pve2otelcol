@@ -3,6 +3,7 @@ package pve
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/alberanid/pve2otelcol/config"
 	"github.com/alberanid/pve2otelcol/ologgers"
-	"golang.org/x/exp/rand"
 )
 
 type LXC struct {
@@ -43,11 +43,11 @@ func New(cfg *config.Config) *Pve {
 	return &pve
 }
 
-func runMonitoringProcess(id int) context.CancelFunc {
+func (p *Pve) RunMonitoringProcess(lxc *LXC) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmdArgs := []string{
 		"exec",
-		fmt.Sprintf("%d", id),
+		fmt.Sprintf("%d", lxc.Id),
 		"--",
 		"journalctl",
 		"-f",
@@ -61,8 +61,14 @@ func runMonitoringProcess(id int) context.CancelFunc {
 		defer cmd.Wait()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			s := scanner.Text()
-			fmt.Println(s)
+			line := scanner.Text()
+			var jData interface{}
+			err := json.Unmarshal([]byte(line), &jData)
+			if err != nil {
+				lxc.Logger.Log(line)
+			} else {
+				lxc.Logger.Log(jData)
+			}
 		}
 	}()
 	return cancel
@@ -122,16 +128,14 @@ func (p *Pve) UpdateLXC(l *LXC) *LXC {
 }
 
 func (p *Pve) StartLXCMonitoring(l *LXC) {
-	slog.Info("from stopped to running: start monitoring")
 	lxc := p.UpdateLXC(l)
 	if lxc.Logger != nil && !lxc.Running {
-		lxc.StopProcess = runMonitoringProcess(lxc.Id)
+		lxc.StopProcess = p.RunMonitoringProcess(lxc)
 		lxc.Running = true
 	}
 }
 
 func (p *Pve) StopLXCMonitoring(id int) {
-	slog.Info("from running to stopped: stop monitoring")
 	if lxc, ok := p.knownLXCs[id]; ok {
 		if lxc.StopProcess != nil {
 			lxc.StopProcess()
@@ -161,12 +165,6 @@ func (p *Pve) RefreshLXCsMonitoring() {
 	}
 	for _, id := range remove {
 		p.RemoveLXC(id)
-	}
-
-	// XXX: test, remove
-	for id, lxc := range p.knownLXCs {
-		rnd := rand.New(rand.NewSource(uint64(time.Now().UnixNano()))).Uint32()
-		lxc.Logger.Log(fmt.Sprintf("id:%d rnd:%d", id, rnd))
 	}
 }
 
