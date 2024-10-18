@@ -26,58 +26,73 @@ type LXC struct {
 type LXCs map[int]*LXC
 
 type Pve struct {
-	cfg                *config.Config
-	knownLXCs          LXCs
-	UpdateIntervalSecs int
-	ticker             *time.Ticker
-	quitTicker         *chan bool
+	cfg        *config.Config
+	knownLXCs  LXCs
+	ticker     *time.Ticker
+	quitTicker *chan bool
 }
 
 func New(cfg *config.Config) *Pve {
 	pve := Pve{
-		cfg:                cfg,
-		knownLXCs:          LXCs{},
-		UpdateIntervalSecs: 10,
+		cfg:       cfg,
+		knownLXCs: LXCs{},
 	}
-	pve.periodicRefresh()
 	return &pve
 }
 
-func (p *Pve) RunMonitoringProcess(lxc *LXC) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	lxc.StopProcess = cancel
-	cmdArgs := []string{
-		"exec",
-		fmt.Sprintf("%d", lxc.Id),
-		"--",
-		"journalctl",
-		"--lines",
-		"0",
-		"--follow",
-		"--output",
-		"json",
-	}
-	cmd := exec.CommandContext(ctx, "pct", cmdArgs...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		slog.Error(fmt.Sprintf("failure opening standard output of lxc/%d: %v", lxc.Id, err))
-		return err
-	}
-	cmd.Start()
-	go func() {
-		defer cmd.Wait()
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			var jData interface{}
-			err := json.Unmarshal([]byte(line), &jData)
-			if err != nil {
-				lxc.Logger.Log(line)
-			} else {
-				lxc.Logger.Log(jData)
-			}
+func (p *Pve) RunKeptAliveProcess(lxc *LXC) error {
+	for round := 0; round < p.cfg.CmdRetryTimes; round++ {
+		if round > 0 {
+			time.Sleep(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 		}
-	}()
+		finished := make(chan error, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		lxc.StopProcess = cancel
+		cmdArgs := []string{
+			"exec",
+			fmt.Sprintf("%d", lxc.Id),
+			"--",
+			"journalctl",
+			"--lines",
+			"0",
+			"--follow",
+			"--output",
+			"json",
+		}
+		cmd := exec.CommandContext(ctx, "pct", cmdArgs...)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			slog.Error(fmt.Sprintf("failure opening standard output of lxc/%d: %v", lxc.Id, err))
+			continue
+		}
+		err = cmd.Start()
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed to run command: %v", err))
+			continue
+		}
+		go func() {
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				line := scanner.Text()
+				var jData interface{}
+				err := json.Unmarshal([]byte(line), &jData)
+				if err != nil {
+					lxc.Logger.Log(line)
+				} else {
+					lxc.Logger.Log(jData)
+				}
+			}
+			err := cmd.Wait()
+			if !lxc.Running {
+				err = nil
+			}
+			finished <- err
+		}()
+		<-finished
+		if !lxc.Running {
+			break
+		}
+	}
 	return nil
 }
 
@@ -130,8 +145,8 @@ func (p *Pve) UpdateLXC(l *LXC) *LXC {
 func (p *Pve) StartLXCMonitoring(l *LXC) {
 	lxc := p.UpdateLXC(l)
 	if lxc.Logger != nil && !lxc.Running {
-		p.RunMonitoringProcess(lxc)
 		lxc.Running = true
+		go p.RunKeptAliveProcess(lxc)
 	}
 }
 
@@ -169,7 +184,7 @@ func (p *Pve) RefreshLXCsMonitoring() {
 }
 
 func (p *Pve) periodicRefresh() {
-	p.ticker = time.NewTicker(time.Duration(p.UpdateIntervalSecs) * time.Second)
+	p.ticker = time.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
 	quitTicker := make(chan bool)
 	p.quitTicker = &quitTicker
 
@@ -186,6 +201,13 @@ func (p *Pve) periodicRefresh() {
 			}
 		}
 	}()
+}
+
+func (p *Pve) Start() {
+	if p.ticker != nil {
+		return
+	}
+	p.periodicRefresh()
 }
 
 func (p *Pve) Stop() {
