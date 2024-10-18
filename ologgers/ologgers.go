@@ -8,6 +8,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/alberanid/pve2otelcol/config"
+
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -17,6 +19,8 @@ import (
 
 // Transform an interface to an object suitable to be logged by OpenTelemetry
 func transformBody(i interface{}) otellog.Value {
+	// the OpenTelemetry SDK replaces JSON null or unknown values to the "INVALID" string, which is an odd choice;
+	// here we stay consistent with this behavior returning a string, but at least it's empty.
 	_emptyValue := otellog.StringValue("")
 	switch obj := i.(type) {
 	case string:
@@ -69,24 +73,16 @@ type OLogger struct {
 
 // Options of an OLogger instance
 type OLoggerOptions struct {
-	Endpoint    string
 	ServiceName string
-	LoggerName  string
 }
 
 // Create an OLogger instance
-func New(opts OLoggerOptions) (*OLogger, error) {
-	if opts.Endpoint == "" {
-		opts.Endpoint = "http://localhost:4317"
-	}
-	if opts.LoggerName == "" {
-		opts.LoggerName = "pve2otelcol"
-	}
+func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	ctx := context.Background()
 	rpcOptions := []otlploggrpc.Option{
-		otlploggrpc.WithEndpointURL(opts.Endpoint),
-		otlploggrpc.WithCompressor("gzip"),
-		otlploggrpc.WithReconnectionPeriod(time.Duration(time.Duration(10) * time.Second)),
+		otlploggrpc.WithEndpointURL(cfg.OtlpgRPCURL),
+		otlploggrpc.WithCompressor(cfg.OtlpgRPCCompression),
+		otlploggrpc.WithReconnectionPeriod(time.Duration(time.Duration(cfg.OtlpgRPCReconnectionPeriod) * time.Second)),
 		otlploggrpc.WithRetry(otlploggrpc.RetryConfig{
 			Enabled:         true,
 			InitialInterval: time.Duration(2) * time.Second,
@@ -115,7 +111,7 @@ func New(opts OLoggerOptions) (*OLogger, error) {
 		sdklog.WithProcessor(processor),
 		sdklog.WithResource(providerResources),
 	)
-	logger := provider.Logger(opts.LoggerName)
+	logger := provider.Logger(cfg.OtlpLoggerName)
 
 	return &OLogger{
 		Logger: logger,

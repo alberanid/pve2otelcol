@@ -129,8 +129,7 @@ func (p *Pve) CurrentLXCs() LXCs {
 func (p *Pve) UpdateLXC(l *LXC) *LXC {
 	if _, ok := p.knownLXCs[l.Id]; !ok {
 		slog.Info("new, add LXC")
-		logger, err := ologgers.New(ologgers.OLoggerOptions{
-			Endpoint:    p.cfg.OtlpgRPCURL,
+		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
 			ServiceName: fmt.Sprintf("lxc/%d", l.Id),
 		})
 		if err != nil {
