@@ -322,12 +322,13 @@ func (p *Pve) Start() {
 		// do nothing, if already running
 		return
 	}
+	slog.Info("start monitoring")
 	p.periodicRefresh()
 }
 
 // stop all running monitoring processes
 func (p *Pve) Stop() {
-	slog.Debug("stop all monitoring processes")
+	slog.Debug("stop monitoring")
 	p.ticker.Stop()
 	*p.quitTicker <- true
 	for id := range p.knownVMs {
