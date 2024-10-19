@@ -328,7 +328,7 @@ func (p *Pve) Start() {
 
 // stop all running monitoring processes
 func (p *Pve) Stop() {
-	slog.Debug("stop monitoring")
+	slog.Info("stop monitoring")
 	p.ticker.Stop()
 	*p.quitTicker <- true
 	for id := range p.knownVMs {
