@@ -18,6 +18,8 @@ type Config struct {
 	RefreshInterval            int
 	CmdRetryTimes              int
 	CmdRetryDelay              int
+	SkipLXCs                   bool
+	SkipKVMs                   bool
 }
 
 func ParseArgs() *Config {
@@ -29,6 +31,8 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.RefreshInterval, "refresh-interval", DEFAULT_REFRESH_INTERVAL, "refresh interval in seconds")
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
+	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not consider LXCs virtuals")
+	flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
 
 	flag.Parse()
 	return &c

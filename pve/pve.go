@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -15,54 +17,50 @@ import (
 	"github.com/alberanid/pve2otelcol/ologgers"
 )
 
-type LXC struct {
+type VM struct {
 	Id          int
 	Name        string
+	Type        string
+	MonitorCmd  string
+	MonitorArgs []string
 	Running     bool
 	Logger      *ologgers.OLogger
 	StopProcess func()
+	LastError   *error
 }
 
-type LXCs map[int]*LXC
+type VMs map[int]*VM
 
 type Pve struct {
 	cfg        *config.Config
-	knownLXCs  LXCs
+	knownVMs   VMs
 	ticker     *time.Ticker
 	quitTicker *chan bool
 }
 
 func New(cfg *config.Config) *Pve {
 	pve := Pve{
-		cfg:       cfg,
-		knownLXCs: LXCs{},
+		cfg:      cfg,
+		knownVMs: VMs{},
 	}
 	return &pve
 }
 
-func (p *Pve) RunKeptAliveProcess(lxc *LXC) error {
+func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 	for round := 0; round < p.cfg.CmdRetryTimes; round++ {
 		if round > 0 {
 			time.Sleep(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 		}
+		if vm.MonitorCmd == "" {
+			return errors.New("missing monitoring command")
+		}
 		finished := make(chan error, 1)
 		ctx, cancel := context.WithCancel(context.Background())
-		lxc.StopProcess = cancel
-		cmdArgs := []string{
-			"exec",
-			fmt.Sprintf("%d", lxc.Id),
-			"--",
-			"journalctl",
-			"--lines",
-			"0",
-			"--follow",
-			"--output",
-			"json",
-		}
-		cmd := exec.CommandContext(ctx, "pct", cmdArgs...)
+		vm.StopProcess = cancel
+		cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			slog.Error(fmt.Sprintf("failure opening standard output of lxc/%d: %v", lxc.Id, err))
+			slog.Error(fmt.Sprintf("failure opening standard output of vm/%d: %v", vm.Id, err))
 			continue
 		}
 		err = cmd.Start()
@@ -71,36 +69,44 @@ func (p *Pve) RunKeptAliveProcess(lxc *LXC) error {
 			continue
 		}
 		go func() {
+			seenError := false
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
 				line := scanner.Text()
 				var jData interface{}
 				err := json.Unmarshal([]byte(line), &jData)
 				if err != nil {
-					lxc.Logger.Log(line)
+					if !seenError {
+						slog.Error(fmt.Sprintf("failed parsing JSON for vm/%d; some logs will be sent as strings", vm.Id))
+						seenError = true
+					}
+					vm.Logger.Log(line)
 				} else {
-					lxc.Logger.Log(jData)
+					vm.Logger.Log(jData)
 				}
 			}
 			err := cmd.Wait()
-			if !lxc.Running {
+			if !vm.Running {
 				err = nil
 			}
 			finished <- err
 		}()
-		<-finished
-		if !lxc.Running {
+		err = <-finished
+		if !vm.Running {
 			break
+		}
+		if err != nil {
+			vm.LastError = &err
 		}
 	}
 	return nil
 }
 
-func (p *Pve) CurrentLXCs() LXCs {
-	lxcs := LXCs{}
+func (p *Pve) CurrentLXCs() VMs {
+	vms := VMs{}
 	out, err := exec.Command("pct", "list").Output()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure listing LXCs: %v", err))
+		slog.Error(fmt.Sprintf("failure listing VMs: %v", err))
 	}
 	outStr := string(out)
 	for _, line := range strings.Split(outStr, "\n") {
@@ -108,77 +114,105 @@ func (p *Pve) CurrentLXCs() LXCs {
 		if len(items) < 3 {
 			continue
 		}
-		id := items[0]
+		strId := items[0]
 		state := items[1]
 		name := items[2]
 		if state != "running" {
 			continue
 		}
-		numId, err := strconv.Atoi(id)
+		id, err := strconv.Atoi(strId)
 		if err != nil {
 			continue
 		}
-		lxcs[numId] = &LXC{
-			Id:   numId,
-			Name: name,
+		vms[id] = &VM{
+			Id:         id,
+			Name:       name,
+			MonitorCmd: "pct",
+			MonitorArgs: []string{
+				"exec",
+				strId,
+				"--",
+				"journalctl",
+				"--lines",
+				"0",
+				"--follow",
+				"--output",
+				"json",
+			},
 		}
 	}
-	return lxcs
+	return vms
 }
 
-func (p *Pve) UpdateLXC(l *LXC) *LXC {
-	if _, ok := p.knownLXCs[l.Id]; !ok {
-		slog.Info("new, add LXC")
+func (p *Pve) CurrentKVMs() VMs {
+	vms := VMs{}
+	return vms
+}
+
+func (p *Pve) CurrentVMs() VMs {
+	vms := VMs{}
+	if !p.cfg.SkipLXCs {
+		maps.Copy(vms, p.CurrentLXCs())
+	}
+	if !p.cfg.SkipKVMs {
+		maps.Copy(vms, p.CurrentKVMs())
+	}
+	return vms
+}
+
+func (p *Pve) UpdateVM(l *VM) *VM {
+	if _, ok := p.knownVMs[l.Id]; !ok {
+		slog.Info("new, add VM")
 		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
-			ServiceName: fmt.Sprintf("lxc/%d", l.Id),
+			ServiceName: fmt.Sprintf("vm/%d", l.Id),
 		})
 		if err != nil {
-			slog.Warn(fmt.Sprintf("unable to create a logger for lxc/%d", l.Id))
+			slog.Warn(fmt.Sprintf("unable to create a logger for vm/%d", l.Id))
 		}
 		l.Logger = logger
-		p.knownLXCs[l.Id] = l
+		p.knownVMs[l.Id] = l
 	}
-	return p.knownLXCs[l.Id]
+	return p.knownVMs[l.Id]
 }
 
-func (p *Pve) StartLXCMonitoring(l *LXC) {
-	lxc := p.UpdateLXC(l)
-	if lxc.Logger != nil && !lxc.Running {
-		lxc.Running = true
-		go p.RunKeptAliveProcess(lxc)
+func (p *Pve) StartVMMonitoring(l *VM) {
+	vm := p.UpdateVM(l)
+	if vm.Logger != nil && !vm.Running {
+		vm.Running = true
+		go p.RunKeptAliveProcess(vm)
 	}
 }
 
-func (p *Pve) StopLXCMonitoring(id int) {
-	if lxc, ok := p.knownLXCs[id]; ok {
-		if lxc.StopProcess != nil {
-			lxc.StopProcess()
+func (p *Pve) StopVMMonitoring(id int) {
+	if vm, ok := p.knownVMs[id]; ok {
+		if vm.StopProcess != nil {
+			vm.StopProcess()
 		}
-		lxc.Running = false
+		vm.Running = false
 	}
 }
 
-func (p *Pve) RemoveLXC(id int) {
-	slog.Info(fmt.Sprintf("remove LXC %d", id))
-	p.StopLXCMonitoring(id)
-	delete(p.knownLXCs, id)
+func (p *Pve) RemoveVM(id int) {
+	slog.Info(fmt.Sprintf("remove VM %d", id))
+	p.StopVMMonitoring(id)
+	delete(p.knownVMs, id)
 }
 
-func (p *Pve) RefreshLXCsMonitoring() {
-	lxcs := p.CurrentLXCs()
-	for _, lxc := range lxcs {
-		p.StartLXCMonitoring(lxc)
+func (p *Pve) RefreshVMsMonitoring() {
+	vms := p.CurrentVMs()
+	for _, vm := range vms {
+		p.StartVMMonitoring(vm)
 	}
 
 	remove := []int{}
-	for id, lxc := range p.knownLXCs {
-		if _, ok := lxcs[id]; !ok {
-			slog.Info(fmt.Sprintf("Id %d (%s) vanished", id, lxc.Name))
-			remove = append(remove, lxc.Id)
+	for id, vm := range p.knownVMs {
+		if _, ok := vms[id]; !ok {
+			slog.Info(fmt.Sprintf("Id %d (%s) vanished", id, vm.Name))
+			remove = append(remove, vm.Id)
 		}
 	}
 	for _, id := range remove {
-		p.RemoveLXC(id)
+		p.RemoveVM(id)
 	}
 }
 
@@ -188,7 +222,7 @@ func (p *Pve) periodicRefresh() {
 	p.quitTicker = &quitTicker
 
 	// Run the first refresh right now
-	p.RefreshLXCsMonitoring()
+	p.RefreshVMsMonitoring()
 	go func() {
 		for {
 			select {
@@ -196,7 +230,7 @@ func (p *Pve) periodicRefresh() {
 				return
 			// interval task
 			case <-p.ticker.C:
-				p.RefreshLXCsMonitoring()
+				p.RefreshVMsMonitoring()
 			}
 		}
 	}()
@@ -212,7 +246,7 @@ func (p *Pve) Start() {
 func (p *Pve) Stop() {
 	p.ticker.Stop()
 	*p.quitTicker <- true
-	for id := range p.knownLXCs {
-		p.RemoveLXC(id)
+	for id := range p.knownVMs {
+		p.RemoveVM(id)
 	}
 }
