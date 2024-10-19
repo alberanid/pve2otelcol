@@ -17,6 +17,7 @@ import (
 	"github.com/alberanid/pve2otelcol/ologgers"
 )
 
+// configuration used to monitor a VM
 type VM struct {
 	Id          int
 	Name        string
@@ -29,8 +30,10 @@ type VM struct {
 	LastError   *error
 }
 
+// map of VMID to VM information
 type VMs map[int]*VM
 
+// object used to interact with a Proxmox instance
 type Pve struct {
 	cfg        *config.Config
 	knownVMs   VMs
@@ -38,6 +41,7 @@ type Pve struct {
 	quitTicker *chan bool
 }
 
+// return a Pve instance.
 func New(cfg *config.Config) *Pve {
 	pve := Pve{
 		cfg:      cfg,
@@ -46,26 +50,32 @@ func New(cfg *config.Config) *Pve {
 	return &pve
 }
 
+// run a command inside a VM and parse its output that will be sent to a OTLP collector
 func (p *Pve) RunKeptAliveProcess(vm *VM) error {
+	if vm.MonitorCmd == "" {
+		return errors.New("missing monitoring command")
+	}
+	strCmd := fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " "))
 	for round := 0; round < p.cfg.CmdRetryTimes; round++ {
 		if round > 0 {
+			// the process failed to run: try again after a delay
+			slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (run %d of %d)",
+				strCmd, p.cfg.CmdRetryDelay, round, p.cfg.CmdRetryTimes))
 			time.Sleep(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
-		}
-		if vm.MonitorCmd == "" {
-			return errors.New("missing monitoring command")
 		}
 		finished := make(chan error, 1)
 		ctx, cancel := context.WithCancel(context.Background())
+		// store the cancel function so that we can stop it from outside
 		vm.StopProcess = cancel
 		cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			slog.Error(fmt.Sprintf("failure opening standard output of vm/%d: %v", vm.Id, err))
+			slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
 			continue
 		}
 		err = cmd.Start()
 		if err != nil {
-			slog.Error(fmt.Sprintf("failed to run command: %v", err))
+			slog.Error(fmt.Sprintf("failure starting monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
 			continue
 		}
 		go func() {
@@ -77,7 +87,8 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 				err := json.Unmarshal([]byte(line), &jData)
 				if err != nil {
 					if !seenError {
-						slog.Error(fmt.Sprintf("failed parsing JSON for vm/%d; some logs will be sent as strings", vm.Id))
+						slog.Warn(fmt.Sprintf("failure parsing JSON for %s/%d; some logs will be sent as strings: %s",
+							vm.Type, vm.Id, err))
 						seenError = true
 					}
 					vm.Logger.Log(line)
@@ -88,6 +99,8 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 			err := cmd.Wait()
 			if !vm.Running {
 				err = nil
+			} else {
+				slog.Error(fmt.Sprintf("failure running monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
 			}
 			finished <- err
 		}()
@@ -102,6 +115,7 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 	return nil
 }
 
+// return a map containing the currently running LXCs
 func (p *Pve) CurrentLXCs() VMs {
 	vms := VMs{}
 	out, err := exec.Command("pct", "list").Output()
@@ -128,6 +142,7 @@ func (p *Pve) CurrentLXCs() VMs {
 		vms[id] = &VM{
 			Id:         id,
 			Name:       name,
+			Type:       "lxc",
 			MonitorCmd: "pct",
 			MonitorArgs: []string{
 				"exec",
@@ -145,6 +160,7 @@ func (p *Pve) CurrentLXCs() VMs {
 	return vms
 }
 
+// return a map containing the currently running KVMs
 func (p *Pve) CurrentKVMs() VMs {
 	vms := VMs{}
 	out, err := exec.Command("qm", "list").Output()
@@ -171,6 +187,7 @@ func (p *Pve) CurrentKVMs() VMs {
 		vms[id] = &VM{
 			Id:         id,
 			Name:       name,
+			Type:       "qm",
 			MonitorCmd: "qm",
 			MonitorArgs: []string{
 				"exec",
@@ -188,6 +205,7 @@ func (p *Pve) CurrentKVMs() VMs {
 	return vms
 }
 
+// return a map containing the currently running LXCs and KVMs
 func (p *Pve) CurrentVMs() VMs {
 	vms := VMs{}
 	if !p.cfg.SkipLXCs {
@@ -204,29 +222,33 @@ func (p *Pve) CurrentVMs() VMs {
 	return vms
 }
 
-func (p *Pve) UpdateVM(l *VM) *VM {
+// add the received VM to the list of known VMs, creating its logger service if needed
+func (p *Pve) UpdateVM(vm *VM) *VM {
 	if _, ok := p.knownVMs[l.Id]; !ok {
 		slog.Info("new, add VM")
 		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
-			ServiceName: fmt.Sprintf("vm/%d", l.Id),
+			ServiceName: fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 		})
 		if err != nil {
-			slog.Warn(fmt.Sprintf("unable to create a logger for vm/%d", l.Id))
+			slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
 		}
-		l.Logger = logger
-		p.knownVMs[l.Id] = l
+		vm.Logger = logger
+		// store the VM in the list of monitored VMs
+		p.knownVMs[vm.Id] = vm
 	}
-	return p.knownVMs[l.Id]
+	return vm
 }
 
-func (p *Pve) StartVMMonitoring(l *VM) {
-	vm := p.UpdateVM(l)
+// run the monitoring process of a VM
+func (p *Pve) StartVMMonitoring(vm *VM) {
+	p.UpdateVM(vm)
 	if vm.Logger != nil && !vm.Running {
 		vm.Running = true
 		go p.RunKeptAliveProcess(vm)
 	}
 }
 
+// stop the monitoring process of a VM
 func (p *Pve) StopVMMonitoring(id int) {
 	if vm, ok := p.knownVMs[id]; ok {
 		if vm.StopProcess != nil {
@@ -236,6 +258,7 @@ func (p *Pve) StopVMMonitoring(id int) {
 	}
 }
 
+// remove a VM from the list of known VMs
 func (p *Pve) RemoveVM(id int) {
 	slog.Info(fmt.Sprintf("remove VM %d", id))
 	p.StopVMMonitoring(id)

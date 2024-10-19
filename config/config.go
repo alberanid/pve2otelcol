@@ -20,6 +20,7 @@ const DEFAULT_REFRESH_INTERVAL = 10
 const DEFAULT_CMD_RETRY_TIMES = 5
 const DEFAULT_CMD_RETRY_DELAY = 5
 
+// store command line configuration.
 type Config struct {
 	OtlpLoggerName string
 
@@ -39,6 +40,7 @@ type Config struct {
 	Verbose bool
 }
 
+// parse command line arguments.
 func ParseArgs() *Config {
 	c := Config{}
 	flag.StringVar(&c.OtlpLoggerName, "otlp-logger-name", DEFAULT_OTLP_LOGGER_NAME, "OpenTelemetry logger name")
