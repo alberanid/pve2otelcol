@@ -85,9 +85,9 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		otlploggrpc.WithReconnectionPeriod(time.Duration(time.Duration(cfg.OtlpgRPCReconnectionPeriod) * time.Second)),
 		otlploggrpc.WithRetry(otlploggrpc.RetryConfig{
 			Enabled:         true,
-			InitialInterval: time.Duration(2) * time.Second,
-			MaxInterval:     time.Duration(10) * time.Second,
-			MaxElapsedTime:  time.Duration(30) * time.Second,
+			InitialInterval: time.Duration(cfg.OtlpgRPCInitialInterval) * time.Second,
+			MaxInterval:     time.Duration(cfg.OtlpgRPCMaxInterval) * time.Second,
+			MaxElapsedTime:  time.Duration(cfg.OtlpgRPCMaxElapsedTime) * time.Second,
 		}),
 	}
 	exporter, err := otlploggrpc.New(ctx, rpcOptions...)
