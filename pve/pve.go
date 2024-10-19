@@ -50,6 +50,44 @@ func New(cfg *config.Config) *Pve {
 	return &pve
 }
 
+func (p *Pve) runVMMonitoring(vm *VM, ctx context.Context, finished chan error) {
+	cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
+		finished <- err
+	}
+	err = cmd.Start()
+	if err != nil {
+		slog.Error(fmt.Sprintf("failure starting monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
+		finished <- err
+	}
+	seenError := false
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var jData interface{}
+		err := json.Unmarshal([]byte(line), &jData)
+		if err != nil {
+			if !seenError {
+				slog.Warn(fmt.Sprintf("failure parsing JSON for %s/%d; some logs will be sent as strings: %s",
+					vm.Type, vm.Id, err))
+				seenError = true
+			}
+			vm.Logger.Log(line)
+		} else {
+			vm.Logger.Log(jData)
+		}
+	}
+	err = cmd.Wait()
+	if !vm.Running {
+		err = nil
+	} else {
+		slog.Error(fmt.Sprintf("failure running monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
+	}
+	finished <- err
+}
+
 // run a command inside a VM and parse its output that will be sent to a OTLP collector
 func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 	if vm.MonitorCmd == "" {
@@ -68,44 +106,8 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		// store the cancel function so that we can stop it from outside
 		vm.StopProcess = cancel
-		cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
-			continue
-		}
-		err = cmd.Start()
-		if err != nil {
-			slog.Error(fmt.Sprintf("failure starting monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
-			continue
-		}
-		go func() {
-			seenError := false
-			scanner := bufio.NewScanner(stdout)
-			for scanner.Scan() {
-				line := scanner.Text()
-				var jData interface{}
-				err := json.Unmarshal([]byte(line), &jData)
-				if err != nil {
-					if !seenError {
-						slog.Warn(fmt.Sprintf("failure parsing JSON for %s/%d; some logs will be sent as strings: %s",
-							vm.Type, vm.Id, err))
-						seenError = true
-					}
-					vm.Logger.Log(line)
-				} else {
-					vm.Logger.Log(jData)
-				}
-			}
-			err := cmd.Wait()
-			if !vm.Running {
-				err = nil
-			} else {
-				slog.Error(fmt.Sprintf("failure running monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
-			}
-			finished <- err
-		}()
-		err = <-finished
+		go p.runVMMonitoring(vm, ctx, finished)
+		err := <-finished
 		if !vm.Running {
 			break
 		}
