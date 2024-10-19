@@ -56,9 +56,7 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 		return errors.New("missing monitoring command")
 	}
 	strCmd := fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " "))
-	if p.cfg.Verbose {
-		slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
-	}
+	slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
 	for round := 0; round < p.cfg.CmdRetryTimes; round++ {
 		if round > 0 {
 			// the process failed to run: try again after a delay
@@ -120,9 +118,7 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 
 // return a map containing the currently running LXCs
 func (p *Pve) CurrentLXCs() VMs {
-	if p.cfg.Verbose {
-		slog.Debug("updating list of running LXCs")
-	}
+	slog.Debug("updating list of running LXCs")
 	vms := VMs{}
 	out, err := exec.Command("pct", "list").Output()
 	if err != nil {
@@ -168,9 +164,7 @@ func (p *Pve) CurrentLXCs() VMs {
 
 // return a map containing the currently running KVMs
 func (p *Pve) CurrentKVMs() VMs {
-	if p.cfg.Verbose {
-		slog.Debug("updating list of running KVMs")
-	}
+	slog.Debug("updating list of running KVMs")
 	vms := VMs{}
 	out, err := exec.Command("qm", "list").Output()
 	if err != nil {
@@ -234,9 +228,7 @@ func (p *Pve) CurrentVMs() VMs {
 // add the received VM to the list of known VMs, creating its logger service if needed
 func (p *Pve) UpdateVM(vm *VM) *VM {
 	if _, ok := p.knownVMs[vm.Id]; !ok {
-		if p.cfg.Verbose {
-			slog.Debug("adding newly found VM %s/%d", vm.Type, vm.Id)
-		}
+		slog.Debug(fmt.Sprintf("adding newly found VM %s/%d", vm.Type, vm.Id))
 		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
 			ServiceName: fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 		})
@@ -254,9 +246,7 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 func (p *Pve) StartVMMonitoring(vm *VM) {
 	p.UpdateVM(vm)
 	if vm.Logger != nil && !vm.Running {
-		if p.cfg.Verbose {
-			slog.Debug("start monitoring VM %s/%d", vm.Type, vm.Id)
-		}
+		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", vm.Type, vm.Id))
 		vm.Running = true
 		go p.RunKeptAliveProcess(vm)
 	}
@@ -266,9 +256,7 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 func (p *Pve) StopVMMonitoring(id int) {
 	if vm, ok := p.knownVMs[id]; ok {
 		if vm.StopProcess != nil {
-			if p.cfg.Verbose {
-				slog.Debug("stop monitoring VM %s/%d", vm.Type, vm.Id)
-			}
+			slog.Debug(fmt.Sprintf("stop monitoring VM %s/%d", vm.Type, vm.Id))
 			vm.StopProcess()
 		}
 		vm.Running = false
@@ -281,9 +269,7 @@ func (p *Pve) RemoveVM(id int) {
 	if vm, ok := p.knownVMs[id]; ok {
 		vmDesc = fmt.Sprintf("%s/%d", vm.Type, id)
 	}
-	if p.cfg.Verbose {
-		slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
-	}
+	slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
 	p.StopVMMonitoring(id)
 	delete(p.knownVMs, id)
 }
@@ -341,9 +327,7 @@ func (p *Pve) Start() {
 
 // stop all running monitoring processes
 func (p *Pve) Stop() {
-	if p.cfg.Verbose {
-		slog.Debug("stop all monitoring processes")
-	}
+	slog.Debug("stop all monitoring processes")
 	p.ticker.Stop()
 	*p.quitTicker <- true
 	for id := range p.knownVMs {

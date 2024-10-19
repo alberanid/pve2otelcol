@@ -103,5 +103,9 @@ func ParseArgs() *Config {
 		os.Exit(1)
 	}
 
+	if c.Verbose {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
 	return &c
 }
