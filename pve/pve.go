@@ -256,12 +256,15 @@ func (p *Pve) RefreshVMsMonitoring() {
 }
 
 func (p *Pve) periodicRefresh() {
+	// Run the first refresh right now
+	p.RefreshVMsMonitoring()
+	if p.cfg.RefreshInterval == 0 {
+		// no refresh: do not monitor for new/vanished VMs
+		return
+	}
 	p.ticker = time.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
 	quitTicker := make(chan bool)
 	p.quitTicker = &quitTicker
-
-	// Run the first refresh right now
-	p.RefreshVMsMonitoring()
 	go func() {
 		for {
 			select {

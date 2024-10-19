@@ -1,6 +1,13 @@
 package config
 
-import "flag"
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+
+	"github.com/alberanid/pve2otelcol/version"
+)
 
 const DEFAULT_OTLP_LOGGER_NAME = "pve2otelcol"
 const DEFAULT_OTLP_GRPC_URL = "http://localhost:4317"
@@ -20,6 +27,7 @@ type Config struct {
 	CmdRetryDelay              int
 	SkipLXCs                   bool
 	SkipKVMs                   bool
+	Verbose                    bool
 }
 
 func ParseArgs() *Config {
@@ -33,7 +41,44 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
 	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not consider LXCs virtuals")
 	flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
-
+	flag.BoolVar(&c.Verbose, "verbose", false, "be more verbose")
+	getVer := flag.Bool("version", false, "print version and quit")
 	flag.Parse()
+
+	if *getVer {
+		fmt.Printf("version %s\n", version.VERSION)
+		os.Exit(0)
+	}
+
+	if c.OtlpgRPCCompression != "none" && c.OtlpgRPCCompression != "gzip" {
+		slog.Error("otlp-grpc-compression must be \"none\" or \"gzip\"")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if c.OtlpgRPCReconnectionPeriod < 0 {
+		slog.Error("otlp-grpc-reconnection-period must be equal or greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if c.RefreshInterval < 0 {
+		slog.Error("refresh-interval must be equal or greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if c.CmdRetryTimes < 0 {
+		slog.Error("cmd-retry-times must be equal or greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if c.CmdRetryDelay < 0 {
+		slog.Error("cmd-retry-delay must be equal or greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
 	return &c
 }
