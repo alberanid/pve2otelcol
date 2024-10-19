@@ -106,7 +106,8 @@ func (p *Pve) CurrentLXCs() VMs {
 	vms := VMs{}
 	out, err := exec.Command("pct", "list").Output()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure listing VMs: %v", err))
+		slog.Error(fmt.Sprintf("failure listing LXCs: %v", err))
+		return vms
 	}
 	outStr := string(out)
 	for _, line := range strings.Split(outStr, "\n") {
@@ -146,6 +147,44 @@ func (p *Pve) CurrentLXCs() VMs {
 
 func (p *Pve) CurrentKVMs() VMs {
 	vms := VMs{}
+	out, err := exec.Command("qm", "list").Output()
+	if err != nil {
+		slog.Error(fmt.Sprintf("failure listing KVMs: %v", err))
+		return vms
+	}
+	outStr := string(out)
+	for _, line := range strings.Split(outStr, "\n") {
+		items := strings.Fields(line)
+		if len(items) < 3 {
+			continue
+		}
+		strId := items[0]
+		name := items[1]
+		state := items[2]
+		if state != "running" {
+			continue
+		}
+		id, err := strconv.Atoi(strId)
+		if err != nil {
+			continue
+		}
+		vms[id] = &VM{
+			Id:         id,
+			Name:       name,
+			MonitorCmd: "qm",
+			MonitorArgs: []string{
+				"exec",
+				strId,
+				"--",
+				"journalctl",
+				"--lines",
+				"0",
+				"--follow",
+				"--output",
+				"json",
+			},
+		}
+	}
 	return vms
 }
 
