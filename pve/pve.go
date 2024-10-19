@@ -193,9 +193,14 @@ func (p *Pve) CurrentVMs() VMs {
 	if !p.cfg.SkipLXCs {
 		maps.Copy(vms, p.CurrentLXCs())
 	}
-	if !p.cfg.SkipKVMs {
-		maps.Copy(vms, p.CurrentKVMs())
-	}
+	/*
+		// right now KVMs are not monitored, since the qm exec command
+		// always block until the command exits, making it impossible to
+		// parse the output as a stream.
+		if !p.cfg.SkipKVMs {
+			maps.Copy(vms, p.CurrentKVMs())
+		}
+	*/
 	return vms
 }
 

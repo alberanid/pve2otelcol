@@ -40,7 +40,8 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
 	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not consider LXCs virtuals")
-	flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
+	// it will be reintroduced if we'll find a way to get the stdout stream from a qm exec command.
+	//flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
 	flag.BoolVar(&c.Verbose, "verbose", false, "be more verbose")
 	getVer := flag.Bool("version", false, "print version and quit")
 	flag.Parse()
