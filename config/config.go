@@ -41,6 +41,7 @@ type Config struct {
 	CmdRetryTimes   int
 	CmdRetryDelay   int
 	SkipLXCs        bool
+	SkipPVE         bool
 	//SkipKVMs     	bool
 
 	Verbose bool
@@ -73,7 +74,8 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.RefreshInterval, "refresh-interval", DEFAULT_REFRESH_INTERVAL, "refresh interval in seconds")
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
-	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not consider LXCs virtuals")
+	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not monitor LXCs virtuals")
+	flag.BoolVar(&c.SkipPVE, "skip-pve", false, "do not monitor this PVE node")
 	// it will be reintroduced if we'll find a way to get the stdout stream from a qm exec command.
 	//flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
 

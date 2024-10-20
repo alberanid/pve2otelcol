@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -90,19 +91,25 @@ func (p *Pve) runVMMonitoring(vm *VM, ctx context.Context, finished chan error) 
 }
 
 // run a command inside a VM and parse its output that will be sent to a OTLP collector
-func (p *Pve) RunKeptAliveProcess(vm *VM) error {
+func (p *Pve) RunKeptAliveProcess(vm *VM, forever bool) error {
 	if vm.MonitorCmd == "" {
 		return errors.New("missing monitoring command")
 	}
 	strCmd := fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " "))
 	slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
-	for round := 0; round < p.cfg.CmdRetryTimes; round++ {
+	round := 0
+	for {
+		if round >= p.cfg.CmdRetryTimes && !forever {
+			slog.Error(fmt.Sprintf("monitoring of %s/%d failed %d times: giving up", vm.Type, vm.Id, round))
+			break
+		}
 		if round > 0 {
 			// the process failed to run: try again after a delay
 			slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (run %d of %d)",
 				strCmd, p.cfg.CmdRetryDelay, round, p.cfg.CmdRetryTimes))
 			time.Sleep(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 		}
+		round++
 		finished := make(chan error, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		// store the cancel function so that we can stop it from outside
@@ -117,6 +124,37 @@ func (p *Pve) RunKeptAliveProcess(vm *VM) error {
 		}
 	}
 	return nil
+}
+
+// monitor Proxmox itself
+func (p *Pve) pveSelfMonitoring() {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "localhost"
+	}
+	slog.Debug(fmt.Sprintf("start PVE self-monitoring for node %s", hostname))
+	vm := VM{
+		Id:         0,
+		Name:       hostname,
+		Type:       "pve",
+		MonitorCmd: "journalctl",
+		MonitorArgs: []string{
+			"--lines",
+			"0",
+			"--follow",
+			"--output",
+			"json",
+		},
+	}
+	logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
+		ServiceName: vm.Name,
+		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
+	})
+	if err != nil {
+		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
+	}
+	vm.Logger = logger
+	go p.RunKeptAliveProcess(&vm, true)
 }
 
 // return a map containing the currently running LXCs
@@ -252,7 +290,7 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 	if vm.Logger != nil && !vm.Running {
 		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", vm.Type, vm.Id))
 		vm.Running = true
-		go p.RunKeptAliveProcess(vm)
+		go p.RunKeptAliveProcess(vm, false)
 	}
 }
 
@@ -327,6 +365,9 @@ func (p *Pve) Start() {
 		return
 	}
 	slog.Info("start monitoring")
+	if !p.cfg.SkipPVE {
+		p.pveSelfMonitoring()
+	}
 	p.periodicRefresh()
 }
 
