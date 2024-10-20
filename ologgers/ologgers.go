@@ -161,7 +161,10 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		return nil, err
 	}
 
-	processor := sdklog.NewBatchProcessor(exporter)
+	processor := sdklog.NewBatchProcessor(exporter,
+		sdklog.WithExportBufferSize(cfg.OtlpBatchBufferSize),
+		sdklog.WithExportInterval(time.Duration(cfg.OtlpBatchExportInterval)*time.Second),
+		sdklog.WithExportMaxBatchSize(cfg.OtlpBatchMaxBatchSize))
 	provider := sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(processor),
 		sdklog.WithResource(providerResources),

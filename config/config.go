@@ -16,6 +16,9 @@ const DEFAULT_OTLP_GRPC_RECONNECTION_PERIOD = 10
 const DEFAULT_OTLP_GRPC_INITIAL_INTERVAL = 2
 const DEFAULT_OTLP_GRPC_MAX_INTERVAL = 10
 const DEFAULT_OTLP_GRPC_MAX_ELAPSED_TIME = 30
+const DEFAULT_OTLP_BATCH_BUFFER_SIZE = 1
+const DEFAULT_OTLP_BATCH_EXPORT_INTERVAL = 1
+const DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE = 512
 const DEFAULT_REFRESH_INTERVAL = 10
 const DEFAULT_CMD_RETRY_TIMES = 5
 const DEFAULT_CMD_RETRY_DELAY = 5
@@ -30,6 +33,9 @@ type Config struct {
 	OtlpgRPCInitialInterval    int
 	OtlpgRPCMaxInterval        int
 	OtlpgRPCMaxElapsedTime     int
+	OtlpBatchBufferSize        int
+	OtlpBatchExportInterval    int
+	OtlpBatchMaxBatchSize      int
 
 	RefreshInterval int
 	CmdRetryTimes   int
@@ -57,6 +63,13 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.OtlpgRPCMaxElapsedTime, "otlp-grpc-max-elapsed-time",
 		DEFAULT_OTLP_GRPC_MAX_ELAPSED_TIME, "OpenTelemetry gRPC maximum amount of time (including retries) spent trying to send a request/batch in seconds")
 
+	flag.IntVar(&c.OtlpBatchBufferSize, "otlp-batch-buffer-size",
+		DEFAULT_OTLP_BATCH_BUFFER_SIZE, "OpenTelemetry batch buffer size that is kept in memory")
+	flag.IntVar(&c.OtlpBatchExportInterval, "otlp-batch-export-interval",
+		DEFAULT_OTLP_BATCH_EXPORT_INTERVAL, "OpenTelemetry maximum duration between batched exports in seconds")
+	flag.IntVar(&c.OtlpBatchMaxBatchSize, "otlp-batch-max-batch-size",
+		DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE, "OpenTelemetry maximum batch size of every export")
+
 	flag.IntVar(&c.RefreshInterval, "refresh-interval", DEFAULT_REFRESH_INTERVAL, "refresh interval in seconds")
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
@@ -78,25 +91,36 @@ func ParseArgs() *Config {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-
 	if c.OtlpgRPCReconnectionPeriod < 0 {
 		slog.Error("otlp-grpc-reconnection-period must be equal or greater than zero")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-
+	if c.OtlpBatchBufferSize < 1 {
+		slog.Error("otlp-batch-buffer-size must be greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	if c.OtlpBatchExportInterval < 1 {
+		slog.Error("otlp-batch-export-interval must be greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	if c.OtlpBatchMaxBatchSize < 1 {
+		slog.Error("otlp-batch-max-batch-size must be greater than zero")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
 	if c.RefreshInterval < 0 {
 		slog.Error("refresh-interval must be equal or greater than zero")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-
 	if c.CmdRetryTimes < 0 {
 		slog.Error("cmd-retry-times must be equal or greater than zero")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-
 	if c.CmdRetryDelay < 0 {
 		slog.Error("cmd-retry-delay must be equal or greater than zero")
 		flag.PrintDefaults()
