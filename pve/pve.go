@@ -50,6 +50,7 @@ func New(cfg *config.Config) *Pve {
 	return &pve
 }
 
+// execute the command to get and parse logs from a VM
 func (p *Pve) runVMMonitoring(vm *VM, ctx context.Context, finished chan error) {
 	cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
 	stdout, err := cmd.StdoutPipe()

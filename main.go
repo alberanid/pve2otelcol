@@ -11,17 +11,25 @@ import (
 
 func main() {
 	cfg := config.ParseArgs()
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	done := make(chan bool, 1)
+	stopSigs := make(chan os.Signal, 1)
+	signal.Notify(stopSigs, syscall.SIGINT, syscall.SIGTERM)
+	refreshSig := make(chan os.Signal, 1)
+	signal.Notify(refreshSig, syscall.SIGUSR1)
 
 	p := pve.New(cfg)
 	p.Start()
 
 	go func() {
-		<-sigs
+		<-stopSigs
 		p.Stop()
 		done <- true
+	}()
+	go func() {
+		for {
+			<-refreshSig
+			p.RefreshVMsMonitoring()
+		}
 	}()
 	<-done
 }
