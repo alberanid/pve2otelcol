@@ -20,13 +20,17 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
+// map syslog severity levels (priority, in systemd) to OTLP severity.
+// We use only main levels, to prevent loki ingestor warnings like "msg="unknown log level while observing stream" level=info2".
+// Ideally intermediate levels should be used; see:
+// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/data-model-appendix.md#appendix-b-severitynumber-example-mappings
 var prio2severity = map[string]otellog.Severity{
 	"0": otellog.SeverityFatal,
-	"1": otellog.SeverityError3,
-	"2": otellog.SeverityError2,
+	"1": otellog.SeverityError, // ideally SeverityError3
+	"2": otellog.SeverityError, // ideally SeverityError2
 	"3": otellog.SeverityError,
 	"4": otellog.SeverityWarn,
-	"5": otellog.SeverityInfo2,
+	"5": otellog.SeverityInfo, // ideally, SeverityInfo2
 	"6": otellog.SeverityInfo,
 	"7": otellog.SeverityDebug,
 }
