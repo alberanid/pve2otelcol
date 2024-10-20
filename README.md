@@ -6,9 +6,11 @@ This means that no agent is needed on individual VMs: logs are collected from th
 
 **pve2otelcol** can monitor the [journald](https://www.freedesktop.org/software/systemd/man/latest/systemd-journald.service.html) logs of the PVE node and of each running VM, periodically monitoring them for start and stop events.
 
-## Disclaimers
+The logs, connected in JSON format, are parsed and sent to the OpenTelemetry collector where they can be easily routed, parsed, inspected and visualized.
 
-This software is in beta state; ideas for improvements can be [discussed on Github](https://github.com/alberanid/pve2otelcol/discussions); in the same way, any [bug report](https://github.com/alberanid/pve2otelcol/issues) and pull request is welcome.
+## Disclaimer and limitations
+
+This software is in alpha state; ideas for improvements can be [discussed on Github](https://github.com/alberanid/pve2otelcol/discussions); in the same way, any [bug report](https://github.com/alberanid/pve2otelcol/issues) and pull request is welcome.
 
 At the moment it can't monitor Qemu/KVM virtual machines, since running `qm exec VMID -- journalctl --follow` produces no output to be parsed (it's not a stream like the `pct exec VMID -- journalctl --follow` that's used to monitor LXC containers).
 

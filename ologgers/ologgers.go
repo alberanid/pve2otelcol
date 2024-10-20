@@ -157,7 +157,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		),
 	)
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure setting service of logger; error: %v", err))
+		slog.Error(fmt.Sprintf("failure setting service name of logger; error: %v", err))
 		return nil, err
 	}
 
