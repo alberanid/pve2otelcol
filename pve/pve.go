@@ -97,6 +97,10 @@ func (p *Pve) RunKeptAliveProcess(vm *VM, forever bool) error {
 	}
 	strCmd := fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " "))
 	slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
+	if p.cfg.DryRun {
+		slog.Info(fmt.Sprintf("DRY RUN: %s", strCmd))
+		return nil
+	}
 	round := 0
 	for {
 		if round >= p.cfg.CmdRetryTimes && !forever {

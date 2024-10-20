@@ -44,6 +44,7 @@ type Config struct {
 	SkipPVE         bool
 	//SkipKVMs     	bool
 
+	DryRun  bool
 	Verbose bool
 }
 
@@ -79,6 +80,7 @@ func ParseArgs() *Config {
 	// it will be reintroduced if we'll find a way to get the stdout stream from a qm exec command.
 	//flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
 
+	flag.BoolVar(&c.DryRun, "dry-run", false, "do not execute any command")
 	flag.BoolVar(&c.Verbose, "verbose", false, "be more verbose")
 	getVer := flag.Bool("version", false, "print version and quit")
 	flag.Parse()
