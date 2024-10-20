@@ -6,6 +6,7 @@ Interface to the OpenTelemetry modules.
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -16,6 +17,28 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
+
+var prio2severity = map[string]otellog.Severity{
+	"0": otellog.SeverityFatal,
+	"1": otellog.SeverityError3,
+	"2": otellog.SeverityError2,
+	"3": otellog.SeverityError,
+	"4": otellog.SeverityWarn,
+	"5": otellog.SeverityInfo2,
+	"6": otellog.SeverityInfo,
+	"7": otellog.SeverityDebug,
+}
+
+var prio2string = map[string]string{
+	"0": "emergency",
+	"1": "alert",
+	"2": "critical",
+	"3": "error",
+	"4": "warning",
+	"5": "notice",
+	"6": "info",
+	"7": "debug",
+}
 
 // Transform an interface to an object suitable to be logged by OpenTelemetry
 func transformBody(i interface{}) otellog.Value {
@@ -63,6 +86,18 @@ func transformBody(i interface{}) otellog.Value {
 	default:
 		return _emptyValue
 	}
+}
+
+// convert a string timestamp in microseconds to a time.Time instance
+func str2time(s string) (time.Time, error) {
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return time.Now(), nil
+	}
+	secs := int64(i / 1000000)
+	micros := int64(i%1000000) * 1000
+	tm := time.Unix(secs, micros)
+	return tm, nil
 }
 
 // Object used to log to an OpenTelemetry instance
@@ -129,5 +164,38 @@ func (o *OLogger) Log(i interface{}) {
 	body := transformBody(i)
 	record := otellog.Record{}
 	record.SetBody(body)
+	for _, kv := range body.AsMap() {
+		if kv.Key == "_SOURCE_REALTIME_TIMESTAMP" {
+			tm, err := str2time(kv.Value.AsString())
+			if err != nil {
+				record.SetTimestamp(tm)
+			}
+		} else if kv.Key == "__REALTIME_TIMESTAMP" {
+			tm, err := str2time(kv.Value.AsString())
+			if err != nil {
+				record.SetObservedTimestamp(tm)
+			}
+		} else if kv.Key == "PRIORITY" {
+			if severity, ok := prio2severity[kv.Value.AsString()]; ok {
+				record.SetSeverity(severity)
+			}
+			if severityTxt, ok := prio2string[kv.Value.AsString()]; ok {
+				record.SetSeverityText(severityTxt)
+			}
+		} else if kv.Key == "_PID" {
+			i, err := strconv.Atoi(kv.Value.AsString())
+			if err == nil {
+				record.AddAttributes(otellog.KeyValue{
+					Key:   "pid",
+					Value: otellog.IntValue(i),
+				})
+			}
+		} else if kv.Key == "_COMM" {
+			record.AddAttributes(otellog.KeyValue{
+				Key:   "command",
+				Value: otellog.StringValue(kv.Value.AsString()),
+			})
+		}
+	}
 	o.LogRecord(record)
 }
