@@ -36,14 +36,14 @@ var prio2severity = map[string]otellog.Severity{
 }
 
 var prio2string = map[string]string{
-	"0": "emergency",
-	"1": "alert",
-	"2": "critical",
-	"3": "error",
-	"4": "warning",
-	"5": "notice",
-	"6": "info",
-	"7": "debug",
+	"0": "FATAL",
+	"1": "ERROR",
+	"2": "ERROR",
+	"3": "ERROR",
+	"4": "WARN",
+	"5": "INFO",
+	"6": "INFO",
+	"7": "DEBUG",
 }
 
 // Transform an interface to an object suitable to be logged by OpenTelemetry
