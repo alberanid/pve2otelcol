@@ -34,6 +34,21 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 **pve2otelcol** has numerous other command line options, see `./pve2otelcol --help` for more information. The defaults should be reasonable values in most of the cases.
 
+### Systemd unit
+
+To better integrate it with your PVE node, you can use the provided systemd unit file.
+
+A quick guide, to be run as root (do not forget to edit the pve2otelcol.service beforehand, to point it to your OpenTelemetry collector):
+
+```sh
+cp pve2otelcol /usr/local/bin/
+chmod 755 /usr/local/bin/pve2otelcol
+cp goodies/pve2otelcol.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable pve2otelcol.service
+systemctl start pve2otelcol.service
+```
+
 ## Alloy and Loki configuration
 
 While the setup of Alloy and Loki is well outside the scope of this document, here you can find a skeleton configuration file for both of them.

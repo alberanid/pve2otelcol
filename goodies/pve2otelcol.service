@@ -1,0 +1,11 @@
+[Unit]
+Description=Send PVE logs to OpenTelemetry collector
+After=network.target
+Wants=network.target
+
+[Service]
+Restart=on-failure
+ExecStart=/usr/local/bin/pve2otelcol --otlp-grpc-url http://collector.address:4317
+
+[Install]
+WantedBy=multi-user.target
