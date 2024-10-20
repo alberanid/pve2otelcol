@@ -232,7 +232,8 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 	if _, ok := p.knownVMs[vm.Id]; !ok {
 		slog.Debug(fmt.Sprintf("adding newly found VM %s/%d", vm.Type, vm.Id))
 		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
-			ServiceName: fmt.Sprintf("%s/%d", vm.Type, vm.Id),
+			ServiceName: vm.Name,
+			ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 		})
 		if err != nil {
 			slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))

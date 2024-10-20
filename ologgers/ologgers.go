@@ -6,6 +6,8 @@ Interface to the OpenTelemetry modules.
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -108,6 +110,7 @@ type OLogger struct {
 
 // Options of an OLogger instance
 type OLoggerOptions struct {
+	ServiceId   string
 	ServiceName string
 }
 
@@ -127,6 +130,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	}
 	exporter, err := otlploggrpc.New(ctx, rpcOptions...)
 	if err != nil {
+		slog.Error(fmt.Sprintf("failure creating logger with options %v; error: %v", opts, err))
 		return nil, err
 	}
 
@@ -134,10 +138,22 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
+			semconv.ServiceInstanceID(opts.ServiceId),
+		),
+	)
+	if err != nil {
+		slog.Error(fmt.Sprintf("failure setting service instance id of logger; error: %v", err))
+		return nil, err
+	}
+	providerResources, err = resource.Merge(
+		providerResources,
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
 			semconv.ServiceName(opts.ServiceName),
 		),
 	)
 	if err != nil {
+		slog.Error(fmt.Sprintf("failure setting service of logger; error: %v", err))
 		return nil, err
 	}
 
