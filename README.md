@@ -170,6 +170,14 @@ frontend:
 
 After that, you can start **pve2otelcol** and point it to the Alloy collector and then add the Loki data source in Grafana and begin creating dashboards.
 
+## Grafana dashboards examples
+
+![](docs/logs-per-hour-by-level.png)
+
+![](docs/logs-per-hour-by-job.png)
+
+![](docs/last-logs.png)
+
 ## Copyright and license
 
 2024 Davide Alberani <da@mimante.net>
