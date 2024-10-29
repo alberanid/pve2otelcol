@@ -184,9 +184,9 @@ After that, you can start **pve2otelcol** and point it to the Alloy collector an
 
 ![](docs/last-logs.png)
 
-### dig-down the content of a single log entry
+### drill-down the content of a single log entry
 
-![](docs/dig-down-log-entry.png)
+![](docs/drill-down-log-entry.png)
 
 ## Copyright and license
 
