@@ -2,17 +2,17 @@
 
 **pve2otelcol** is a program to monitor the VMs running on a [Proxmox Virtual Environment](https://www.proxmox.com/) (*PVE*) node, collecting their logs and sending them to an [OpenTelemetry collector](https://opentelemetry.io/), trying to be as little intrusive as possible.
 
-This means that no agent is needed on individual VMs: logs are collected from the PVE node itself.
+This means that no agent is needed on individual VMs: logs are collected by a program running on the PVE node itself.
 
 **pve2otelcol** can monitor the [journald](https://www.freedesktop.org/software/systemd/man/latest/systemd-journald.service.html) logs of the PVE node and of each running VM, periodically monitoring them for start and stop events.
 
-The logs, connected in JSON format, are parsed and sent to the OpenTelemetry collector where they can be easily routed, parsed, inspected and visualized.
+The logs, connected in JSON format, are parsed and sent to the OpenTelemetry collector where they can be easily routed, parsed, filtered, inspected and visualized directly in Grafana.
 
 ## Disclaimer and limitations
 
 This software is in alpha state; ideas for improvements can be [discussed on Github](https://github.com/alberanid/pve2otelcol/discussions); in the same way, any [bug report](https://github.com/alberanid/pve2otelcol/issues) and pull request is welcome.
 
-At the moment it can't monitor Qemu/KVM virtual machines, since running `qm exec VMID -- journalctl --follow` produces no output to be parsed (it's not a stream like the `pct exec VMID -- journalctl --follow` that's used to monitor LXC containers).
+At the moment **it can't monitor Qemu/KVM virtual machines**, since running `qm exec VMID -- journalctl --follow` produces no output to be parsed (it's not a stream like the `pct exec VMID -- journalctl --follow` that's used to monitor LXC containers).
 
 ## Building it
 
@@ -172,11 +172,21 @@ After that, you can start **pve2otelcol** and point it to the Alloy collector an
 
 ## Grafana dashboards examples
 
+### view logs by severity level
+
 ![](docs/logs-per-hour-by-level.png)
+
+### view logs by VM
 
 ![](docs/logs-per-hour-by-job.png)
 
+### show the last logs
+
 ![](docs/last-logs.png)
+
+### dig-down the content of a single log entry
+
+![](docs/dig-down-log-entry.png)
 
 ## Copyright and license
 
