@@ -174,13 +174,290 @@ After that, you can start **pve2otelcol** and point it to the Alloy collector an
 
 ### view logs by severity level
 
+Query: `count by(level) (count_over_time({exporter="OTLP"} [1h]))`
+
+<details>
+<summary>Click for complete panel JSON</summary>
+
+```json
+{
+  "id": 10,
+  "type": "timeseries",
+  "title": "Logs per hour by level",
+  "gridPos": {
+    "x": 0,
+    "y": 32,
+    "h": 8,
+    "w": 12
+  },
+  "fieldConfig": {
+    "defaults": {
+      "custom": {
+        "drawStyle": "line",
+        "lineInterpolation": "stepBefore",
+        "barAlignment": 0,
+        "barWidthFactor": 0.6,
+        "lineWidth": 1,
+        "fillOpacity": 25,
+        "gradientMode": "none",
+        "spanNulls": false,
+        "insertNulls": false,
+        "showPoints": "never",
+        "pointSize": 5,
+        "stacking": {
+          "mode": "normal",
+          "group": "A"
+        },
+        "axisPlacement": "auto",
+        "axisLabel": "",
+        "axisColorMode": "text",
+        "axisBorderShow": false,
+        "scaleDistribution": {
+          "type": "linear"
+        },
+        "axisCenteredZero": false,
+        "hideFrom": {
+          "tooltip": false,
+          "viz": false,
+          "legend": false
+        },
+        "thresholdsStyle": {
+          "mode": "off"
+        }
+      },
+      "color": {
+        "mode": "palette-classic"
+      },
+      "mappings": [],
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          {
+            "color": "green",
+            "value": null
+          },
+          {
+            "color": "red",
+            "value": 80
+          }
+        ]
+      },
+      "fieldMinMax": false
+    },
+    "overrides": []
+  },
+  "pluginVersion": "11.3.0",
+  "targets": [
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "ce0gjtocsolq8f"
+      },
+      "editorMode": "code",
+      "expr": "count by(level) (count_over_time({exporter=\"OTLP\"} [1h]))",
+      "legendFormat": "{{.level}}",
+      "queryType": "range",
+      "refId": "A",
+      "step": ""
+    }
+  ],
+  "datasource": {
+    "default": false,
+    "type": "loki",
+    "uid": "ce0gjtocsolq8f"
+  },
+  "options": {
+    "tooltip": {
+      "mode": "multi",
+      "sort": "desc"
+    },
+    "legend": {
+      "showLegend": true,
+      "displayMode": "list",
+      "placement": "bottom",
+      "calcs": []
+    }
+  }
+}
+```
+
+</details>
+
 ![](docs/logs-per-hour-by-level.png)
 
 ### view logs by VM
 
+Query: `count by(job) (count_over_time({exporter="OTLP"} [1h]))`
+
+<details>
+<summary>Click for complete panel JSON</summary>
+
+```json
+{
+  "id": 9,
+  "type": "timeseries",
+  "title": "Logs per hour by job",
+  "gridPos": {
+    "x": 12,
+    "y": 32,
+    "h": 8,
+    "w": 12
+  },
+  "fieldConfig": {
+    "defaults": {
+      "custom": {
+        "drawStyle": "line",
+        "lineInterpolation": "linear",
+        "barAlignment": -1,
+        "barWidthFactor": 0.6,
+        "lineWidth": 1,
+        "fillOpacity": 25,
+        "gradientMode": "none",
+        "spanNulls": false,
+        "insertNulls": false,
+        "showPoints": "auto",
+        "pointSize": 5,
+        "stacking": {
+          "mode": "normal",
+          "group": "A"
+        },
+        "axisPlacement": "auto",
+        "axisLabel": "",
+        "axisColorMode": "text",
+        "axisBorderShow": false,
+        "scaleDistribution": {
+          "type": "linear"
+        },
+        "axisCenteredZero": false,
+        "hideFrom": {
+          "tooltip": false,
+          "viz": false,
+          "legend": false
+        },
+        "thresholdsStyle": {
+          "mode": "off"
+        },
+        "lineStyle": {
+          "fill": "solid"
+        }
+      },
+      "color": {
+        "mode": "palette-classic"
+      },
+      "mappings": [],
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          {
+            "color": "green",
+            "value": null
+          },
+          {
+            "color": "red",
+            "value": 80
+          }
+        ]
+      }
+    },
+    "overrides": []
+  },
+  "pluginVersion": "11.3.0",
+  "targets": [
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "ce0gjtocsolq8f"
+      },
+      "editorMode": "builder",
+      "expr": "count by(job) (count_over_time({exporter=\"OTLP\"} [1h]))",
+      "legendFormat": "{{.job}}",
+      "queryType": "range",
+      "refId": "A"
+    }
+  ],
+  "datasource": {
+    "default": false,
+    "type": "loki",
+    "uid": "ce0gjtocsolq8f"
+  },
+  "options": {
+    "tooltip": {
+      "mode": "multi",
+      "sort": "desc"
+    },
+    "legend": {
+      "showLegend": true,
+      "displayMode": "list",
+      "placement": "bottom",
+      "calcs": []
+    }
+  }
+}
+```
+
+</details>
+
 ![](docs/logs-per-hour-by-job.png)
 
 ### show the last logs
+
+Query:
+
+```loki
+{exporter="OTLP"} | json | __error__=`` | line_format `{{.service_name}} {{.severity}}: {{.body_MESSAGE}}`
+```
+
+<details>
+<summary>Click for complete panel JSON</summary>
+
+```json
+{
+  "id": 11,
+  "type": "logs",
+  "title": "Last logs",
+  "gridPos": {
+    "x": 0,
+    "y": 40,
+    "h": 8,
+    "w": 12
+  },
+  "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+  },
+  "pluginVersion": "11.3.0",
+  "targets": [
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "ce0gjtocsolq8f"
+      },
+      "editorMode": "builder",
+      "expr": "{exporter=\"OTLP\"} | json | __error__=`` | line_format `{{.service_name}} {{.severity}}: {{.body_MESSAGE}}`",
+      "maxLines": 100,
+      "queryType": "range",
+      "refId": "A"
+    }
+  ],
+  "datasource": {
+    "default": false,
+    "type": "loki",
+    "uid": "ce0gjtocsolq8f"
+  },
+  "options": {
+    "showTime": true,
+    "showLabels": false,
+    "showCommonLabels": false,
+    "wrapLogMessage": false,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending"
+  }
+}
+```
+
+</details>
 
 ![](docs/last-logs.png)
 
