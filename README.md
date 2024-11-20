@@ -114,7 +114,7 @@ loki.write "local" {
 ```
 
 ```yaml
-# Sample config for Loki.
+# Sample config for Loki 3.3.
 # For a full configuration reference, see https://grafana.com/docs/loki/latest/configure/
 auth_enabled: false
 
@@ -136,13 +136,10 @@ common:
     kvstore:
       store: inmemory
 
-ingester_rf1:
-  enabled: false
 query_range:
   results_cache:
     cache:
       embedded_cache:
-        enabled: true
         max_size_mb: 100
 
 schema_config:
@@ -166,6 +163,10 @@ ruler:
 
 frontend:
   encoding: protobuf
+
+limits_config:
+  ingestion_rate_mb: 24
+  ingestion_burst_size_mb: 36
 ```
 
 After that, you can start **pve2otelcol** and point it to the Alloy collector and then add the Loki data source in Grafana and begin creating dashboards.
