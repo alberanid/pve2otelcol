@@ -28,6 +28,8 @@ type Config struct {
 	OtlpLoggerName string
 
 	OtlpgRPCURL                string
+	OtlpgRPCTLSCertFile        string
+	OtlpgRPCTLSKeyFile         string
 	OtlpgRPCCompression        string
 	OtlpgRPCReconnectionPeriod int
 	OtlpgRPCInitialInterval    int
@@ -54,6 +56,8 @@ func ParseArgs() *Config {
 	flag.StringVar(&c.OtlpLoggerName, "otlp-logger-name", DEFAULT_OTLP_LOGGER_NAME, "OpenTelemetry logger name")
 
 	flag.StringVar(&c.OtlpgRPCURL, "otlp-grpc-url", DEFAULT_OTLP_GRPC_URL, "OpenTelemetry gRPC URL")
+	flag.StringVar(&c.OtlpgRPCTLSCertFile, "otlp-grpc-tls-cert-file", "", "Path to the TLS certificate file")
+	flag.StringVar(&c.OtlpgRPCTLSKeyFile, "otlp-grpc-tls-key-file", "", "Path to the TLS key file")
 	flag.StringVar(&c.OtlpgRPCCompression, "otlp-grpc-compression", DEFAULT_OTLP_GRPC_COMPRESSION,
 		"OpenTelemetry gRPC compression algorithm (\"gzip\" or \"none\")")
 	flag.IntVar(&c.OtlpgRPCReconnectionPeriod, "otlp-grpc-reconnection-period",
@@ -83,11 +87,19 @@ func ParseArgs() *Config {
 	flag.BoolVar(&c.DryRun, "dry-run", false, "do not execute any command")
 	flag.BoolVar(&c.Verbose, "verbose", false, "be more verbose")
 	getVer := flag.Bool("version", false, "print version and quit")
+
 	flag.Parse()
 
 	if *getVer {
 		fmt.Printf("version %s\n", version.VERSION)
 		os.Exit(0)
+	}
+
+	if (c.OtlpgRPCTLSCertFile != "" || c.OtlpgRPCTLSKeyFile != "") &&
+		!(c.OtlpgRPCTLSCertFile != "" && c.OtlpgRPCTLSKeyFile != "") {
+		slog.Error("otlp-grpc-tls-cert-file and otlp-grpc-tls-key-file must both be specified")
+		flag.PrintDefaults()
+		os.Exit(1)
 	}
 
 	if c.OtlpgRPCCompression != "none" && c.OtlpgRPCCompression != "gzip" {

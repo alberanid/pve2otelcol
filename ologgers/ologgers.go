@@ -6,12 +6,16 @@ Interface to the OpenTelemetry modules.
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
+	"google.golang.org/grpc/credentials"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	otellog "go.opentelemetry.io/otel/log"
@@ -132,6 +136,35 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 			MaxElapsedTime:  time.Duration(cfg.OtlpgRPCMaxElapsedTime) * time.Second,
 		}),
 	}
+
+	// Add TLS credentials if provided
+	if cfg.OtlpgRPCTLSCertFile != "" && cfg.OtlpgRPCTLSKeyFile != "" {
+		certificate, err := tls.LoadX509KeyPair(cfg.OtlpgRPCTLSCertFile, cfg.OtlpgRPCTLSKeyFile)
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed to load TLS certificate and key: %v", err))
+			return nil, err
+		}
+
+		certPool := x509.NewCertPool()
+		ca, err := ioutil.ReadFile(cfg.OtlpgRPCTLSCertFile)
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
+			return nil, err
+		}
+
+		if ok := certPool.AppendCertsFromPEM(ca); !ok {
+			slog.Error("failed to append CA certificate to cert pool")
+			return nil, fmt.Errorf("failed to append CA certificate to cert pool")
+		}
+
+		creds := credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			RootCAs:      certPool,
+		})
+
+		rpcOptions = append(rpcOptions, otlploggrpc.WithTLSCredentials(creds))
+	}
+
 	exporter, err := otlploggrpc.New(ctx, rpcOptions...)
 	if err != nil {
 		slog.Error(fmt.Sprintf("failure creating logger with options %v; error: %v", opts, err))
