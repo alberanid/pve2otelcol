@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -161,6 +162,17 @@ func (p *Pve) pveSelfMonitoring() {
 	go p.RunKeptAliveProcess(&vm, true)
 }
 
+// check id against the include and exclude lists
+func (p *Pve) checkLists(id int) bool {
+	if len(p.cfg.MonitorExclude) > 0 && slices.Contains(p.cfg.MonitorExclude, id) {
+		return false
+	}
+	if len(p.cfg.MonitorInclude) > 0 && !slices.Contains(p.cfg.MonitorInclude, id) {
+		return false
+	}
+	return true
+}
+
 // return a map containing the currently running LXCs
 func (p *Pve) CurrentLXCs() VMs {
 	slog.Debug("updating list of running LXCs")
@@ -184,6 +196,9 @@ func (p *Pve) CurrentLXCs() VMs {
 		}
 		id, err := strconv.Atoi(strId)
 		if err != nil {
+			continue
+		}
+		if !p.checkLists(id) {
 			continue
 		}
 		vms[id] = &VM{
@@ -230,6 +245,9 @@ func (p *Pve) CurrentKVMs() VMs {
 		}
 		id, err := strconv.Atoi(strId)
 		if err != nil {
+			continue
+		}
+		if !p.checkLists(id) {
 			continue
 		}
 		vms[id] = &VM{

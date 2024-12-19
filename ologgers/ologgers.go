@@ -9,8 +9,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"log/slog"
+	"os"
 	"strconv"
 	"time"
 
@@ -146,7 +146,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		}
 
 		certPool := x509.NewCertPool()
-		ca, err := ioutil.ReadFile(cfg.OtlpgRPCTLSCertFile)
+		ca, err := os.ReadFile(cfg.OtlpgRPCTLSCertFile)
 		if err != nil {
 			slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
 			return nil, err

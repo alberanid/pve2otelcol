@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/alberanid/pve2otelcol/version"
 )
@@ -45,9 +48,28 @@ type Config struct {
 	SkipLXCs        bool
 	SkipPVE         bool
 	//SkipKVMs     	bool
+	MonitorInclude []int
+	MonitorExclude []int
 
 	DryRun  bool
 	Verbose bool
+}
+
+// Split and trim comma-separated values
+func splitAndTrim(s string) []int {
+	ids := []int{}
+	parts := strings.Split(s, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		id, err := strconv.Atoi(part)
+		if err != nil {
+			slog.Error(fmt.Sprintf("include and exclude list items must be integers; wrong value: '%s'", part))
+			flag.PrintDefaults()
+			os.Exit(1)
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // parse command line arguments.
@@ -83,6 +105,10 @@ func ParseArgs() *Config {
 	flag.BoolVar(&c.SkipPVE, "skip-pve", false, "do not monitor this PVE node")
 	// it will be reintroduced if we'll find a way to get the stdout stream from a qm exec command.
 	//flag.BoolVar(&c.SkipKVMs, "skip-vms", false, "do not consider Qemu/KVM virtuals")
+	var monitorInclude string
+	var monitorExclude string
+	flag.StringVar(&monitorInclude, "monitor-include", "", "Comma-separated list of IDs to include in monitoring")
+	flag.StringVar(&monitorExclude, "monitor-exclude", "", "Comma-separated list of IDs to exclude from monitoring")
 
 	flag.BoolVar(&c.DryRun, "dry-run", false, "do not execute any command")
 	flag.BoolVar(&c.Verbose, "verbose", false, "be more verbose")
@@ -145,6 +171,20 @@ func ParseArgs() *Config {
 
 	if c.Verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	if monitorInclude != "" {
+		c.MonitorInclude = splitAndTrim(monitorInclude)
+	}
+	if monitorExclude != "" {
+		c.MonitorExclude = splitAndTrim(monitorExclude)
+	}
+	for _, id := range c.MonitorInclude {
+		if slices.Contains(c.MonitorExclude, id) {
+			slog.Error(fmt.Sprintf("error: ID %d is present in both include and exclude lists", id))
+			flag.PrintDefaults()
+			os.Exit(1)
+		}
 	}
 
 	return &c
