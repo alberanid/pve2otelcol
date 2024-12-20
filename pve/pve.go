@@ -59,11 +59,13 @@ func (p *Pve) runVMMonitoring(vm *VM, ctx context.Context, finished chan error) 
 	if err != nil {
 		slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
 		finished <- err
+		return
 	}
 	err = cmd.Start()
 	if err != nil {
 		slog.Error(fmt.Sprintf("failure starting monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
 		finished <- err
+		return
 	}
 	seenError := false
 	scanner := bufio.NewScanner(stdout)
@@ -117,6 +119,10 @@ func (p *Pve) RunKeptAliveProcess(vm *VM, forever bool) error {
 		round++
 		finished := make(chan error, 1)
 		ctx, cancel := context.WithCancel(context.Background())
+		if vm.StopProcess != nil {
+			slog.Debug(fmt.Sprintf("stopping existing monitoring process for VM %s/%d", vm.Type, vm.Id))
+			vm.StopProcess()
+		}
 		// store the cancel function so that we can stop it from outside
 		vm.StopProcess = cancel
 		go p.runVMMonitoring(vm, ctx, finished)
