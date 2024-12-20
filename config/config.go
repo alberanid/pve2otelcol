@@ -13,38 +13,37 @@ import (
 )
 
 const DEFAULT_OTLP_LOGGER_NAME = "pve2otelcol"
+const DEFAULT_OTLP_EXPORTER = "grpc"
 const DEFAULT_OTLP_GRPC_URL = "http://localhost:4317"
-const DEFAULT_OTLP_GRPC_COMPRESSION = "gzip"
+const DEFAULT_OTLP_HTTP_URL = "https://localhost:4318"
+const DEFAULT_OTLP_COMPRESSION = "gzip"
 const DEFAULT_OTLP_GRPC_RECONNECTION_PERIOD = 10
-const DEFAULT_OTLP_GRPC_INITIAL_INTERVAL = 2
-const DEFAULT_OTLP_GRPC_MAX_INTERVAL = 10
-const DEFAULT_OTLP_GRPC_MAX_ELAPSED_TIME = 30
+const DEFAULT_OTLP_INITIAL_INTERVAL = 2
+const DEFAULT_OTLP_MAX_INTERVAL = 10
+const DEFAULT_OTLP_MAX_ELAPSED_TIME = 30
 const DEFAULT_OTLP_BATCH_BUFFER_SIZE = 1
 const DEFAULT_OTLP_BATCH_EXPORT_INTERVAL = 1
 const DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE = 512
 const DEFAULT_REFRESH_INTERVAL = 10
 const DEFAULT_CMD_RETRY_TIMES = 5
 const DEFAULT_CMD_RETRY_DELAY = 5
-const DEFAULT_OTLP_HTTP_URL = "https://localhost:4318"
-const DEFAULT_OTLP_HTTP_COMPRESSION = "gzip"
 
 // store command line configuration.
 type Config struct {
-	OtlpLoggerName string
-
+	OtlpLoggerName             string
+	OtlpExporter               string
 	OtlpgRPCURL                string
+	OtlpHTTPURL                string
 	OtlpTLSCertFile            string
 	OtlpTLSKeyFile             string
 	OtlpCompression            string
-	OtlpgRPCReconnectionPeriod int
 	OtlpInitialInterval        int
 	OtlpMaxInterval            int
 	OtlpMaxElapsedTime         int
 	OtlpBatchBufferSize        int
 	OtlpBatchExportInterval    int
 	OtlpBatchMaxBatchSize      int
-
-	OtlpHTTPURL string
+	OtlpgRPCReconnectionPeriod int
 
 	RefreshInterval int
 	CmdRetryTimes   int
@@ -81,19 +80,23 @@ func ParseArgs() *Config {
 	c := Config{}
 	flag.StringVar(&c.OtlpLoggerName, "otlp-logger-name", DEFAULT_OTLP_LOGGER_NAME, "OpenTelemetry logger name")
 
+	flag.StringVar(&c.OtlpgRPCURL, "otlp-exporter", DEFAULT_OTLP_EXPORTER, "OpenTelemetry exporter (\"grpc\" or \"http\")")
 	flag.StringVar(&c.OtlpgRPCURL, "otlp-grpc-url", DEFAULT_OTLP_GRPC_URL, "OpenTelemetry gRPC URL")
+	flag.StringVar(&c.OtlpHTTPURL, "otlp-http-url", DEFAULT_OTLP_HTTP_URL, "OpenTelemetry HTTP URL")
+
 	flag.StringVar(&c.OtlpTLSCertFile, "otlp-tls-cert-file", "", "Path to the TLS certificate file")
 	flag.StringVar(&c.OtlpTLSKeyFile, "otlp-tls-key-file", "", "Path to the TLS key file")
-	flag.StringVar(&c.OtlpCompression, "otlp-compression", DEFAULT_OTLP_GRPC_COMPRESSION,
-		"OpenTelemetry gRPC compression algorithm (\"gzip\" or \"none\")")
+	flag.StringVar(&c.OtlpCompression, "otlp-compression", DEFAULT_OTLP_COMPRESSION,
+		"OpenTelemetry compression algorithm (\"gzip\" or \"none\")")
+	flag.IntVar(&c.OtlpInitialInterval, "otlp-initial-interval",
+		DEFAULT_OTLP_INITIAL_INTERVAL, "OpenTelemetry time to wait after the first failure before retrying in seconds")
+	flag.IntVar(&c.OtlpMaxInterval, "otlp-max-interval",
+		DEFAULT_OTLP_MAX_INTERVAL, "OpenTelemetry upper bound on backoff interval in seconds")
+	flag.IntVar(&c.OtlpMaxElapsedTime, "otlp-max-elapsed-time",
+		DEFAULT_OTLP_MAX_ELAPSED_TIME, "OpenTelemetry maximum amount of time (including retries) spent trying to send a request/batch in seconds")
+
 	flag.IntVar(&c.OtlpgRPCReconnectionPeriod, "otlp-grpc-reconnection-period",
 		DEFAULT_OTLP_GRPC_RECONNECTION_PERIOD, "OpenTelemetry minimum amount of time between connection attempts to the target endpoint in seconds")
-	flag.IntVar(&c.OtlpInitialInterval, "otlp-initial-interval",
-		DEFAULT_OTLP_GRPC_INITIAL_INTERVAL, "OpenTelemetry time to wait after the first failure before retrying in seconds")
-	flag.IntVar(&c.OtlpMaxInterval, "otlp-max-interval",
-		DEFAULT_OTLP_GRPC_MAX_INTERVAL, "OpenTelemetry upper bound on backoff interval in seconds")
-	flag.IntVar(&c.OtlpMaxElapsedTime, "otlp-max-elapsed-time",
-		DEFAULT_OTLP_GRPC_MAX_ELAPSED_TIME, "OpenTelemetry maximum amount of time (including retries) spent trying to send a request/batch in seconds")
 
 	flag.IntVar(&c.OtlpBatchBufferSize, "otlp-batch-buffer-size",
 		DEFAULT_OTLP_BATCH_BUFFER_SIZE, "OpenTelemetry batch buffer size that is kept in memory")
@@ -101,8 +104,6 @@ func ParseArgs() *Config {
 		DEFAULT_OTLP_BATCH_EXPORT_INTERVAL, "OpenTelemetry maximum duration between batched exports in seconds")
 	flag.IntVar(&c.OtlpBatchMaxBatchSize, "otlp-batch-max-batch-size",
 		DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE, "OpenTelemetry maximum batch size of every export")
-
-	flag.StringVar(&c.OtlpHTTPURL, "otlp-http-url", DEFAULT_OTLP_HTTP_URL, "OpenTelemetry HTTP URL")
 
 	flag.IntVar(&c.RefreshInterval, "refresh-interval", DEFAULT_REFRESH_INTERVAL, "refresh interval in seconds")
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
@@ -125,6 +126,12 @@ func ParseArgs() *Config {
 	if *getVer {
 		fmt.Printf("version %s\n", version.VERSION)
 		os.Exit(0)
+	}
+
+	if c.OtlpExporter != "grpc" && c.OtlpExporter != "http" {
+		slog.Error("otlp-exporter must be \"grpc\" or \"http\"")
+		flag.PrintDefaults()
+		os.Exit(1)
 	}
 
 	if (c.OtlpTLSCertFile != "" || c.OtlpTLSKeyFile != "") &&
