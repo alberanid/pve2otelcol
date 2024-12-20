@@ -166,7 +166,9 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 				InitialInterval: time.Duration(cfg.OtlpInitialInterval) * time.Second,
 				MaxInterval:     time.Duration(cfg.OtlpMaxInterval) * time.Second,
 				MaxElapsedTime:  time.Duration(cfg.OtlpMaxElapsedTime) * time.Second,
-			}),
+			},
+			),
+			otlploggrpc.WithTimeout(time.Duration(cfg.OtlpTimeout) * time.Millisecond),
 		}
 
 		if withTLS {
@@ -188,6 +190,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 				MaxInterval:     time.Duration(cfg.OtlpMaxInterval) * time.Second,
 				MaxElapsedTime:  time.Duration(cfg.OtlpMaxElapsedTime) * time.Second,
 			}),
+			otlploghttp.WithTimeout(time.Duration(cfg.OtlpTimeout) * time.Millisecond),
 		}
 		if cfg.OtlpCompression == "gzip" {
 			httpOptions = append(httpOptions, otlploghttp.WithCompression(otlploghttp.GzipCompression))

@@ -21,6 +21,7 @@ const DEFAULT_OTLP_GRPC_RECONNECTION_PERIOD = 10
 const DEFAULT_OTLP_INITIAL_INTERVAL = 2
 const DEFAULT_OTLP_MAX_INTERVAL = 10
 const DEFAULT_OTLP_MAX_ELAPSED_TIME = 30
+const DEFAULT_OTLP_TIMEOUT = 10000
 const DEFAULT_OTLP_BATCH_BUFFER_SIZE = 1
 const DEFAULT_OTLP_BATCH_EXPORT_INTERVAL = 1
 const DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE = 512
@@ -40,6 +41,7 @@ type Config struct {
 	OtlpInitialInterval        int
 	OtlpMaxInterval            int
 	OtlpMaxElapsedTime         int
+	OtlpTimeout                int
 	OtlpBatchBufferSize        int
 	OtlpBatchExportInterval    int
 	OtlpBatchMaxBatchSize      int
@@ -94,6 +96,8 @@ func ParseArgs() *Config {
 		DEFAULT_OTLP_MAX_INTERVAL, "OpenTelemetry upper bound on backoff interval in seconds")
 	flag.IntVar(&c.OtlpMaxElapsedTime, "otlp-max-elapsed-time",
 		DEFAULT_OTLP_MAX_ELAPSED_TIME, "OpenTelemetry maximum amount of time (including retries) spent trying to send a request/batch in seconds")
+	flag.IntVar(&c.OtlpTimeout, "otlp-timeout",
+		DEFAULT_OTLP_TIMEOUT, "OpenTelemetry timeout in milliseconds")
 
 	flag.IntVar(&c.OtlpgRPCReconnectionPeriod, "otlp-grpc-reconnection-period",
 		DEFAULT_OTLP_GRPC_RECONNECTION_PERIOD, "OpenTelemetry minimum amount of time between connection attempts to the target endpoint in seconds")
