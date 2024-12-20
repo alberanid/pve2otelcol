@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -125,50 +126,100 @@ type OLoggerOptions struct {
 // Create an OLogger instance
 func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	ctx := context.Background()
-	rpcOptions := []otlploggrpc.Option{
-		otlploggrpc.WithEndpointURL(cfg.OtlpgRPCURL),
-		otlploggrpc.WithCompressor(cfg.OtlpgRPCCompression),
-		otlploggrpc.WithReconnectionPeriod(time.Duration(time.Duration(cfg.OtlpgRPCReconnectionPeriod) * time.Second)),
-		otlploggrpc.WithRetry(otlploggrpc.RetryConfig{
-			Enabled:         true,
-			InitialInterval: time.Duration(cfg.OtlpgRPCInitialInterval) * time.Second,
-			MaxInterval:     time.Duration(cfg.OtlpgRPCMaxInterval) * time.Second,
-			MaxElapsedTime:  time.Duration(cfg.OtlpgRPCMaxElapsedTime) * time.Second,
-		}),
-	}
+	var exporter sdklog.Exporter
+	var err error
 
-	// Add TLS credentials if provided
-	if cfg.OtlpgRPCTLSCertFile != "" && cfg.OtlpgRPCTLSKeyFile != "" {
-		certificate, err := tls.LoadX509KeyPair(cfg.OtlpgRPCTLSCertFile, cfg.OtlpgRPCTLSKeyFile)
+	if cfg.OtlpgRPCURL != "" {
+		rpcOptions := []otlploggrpc.Option{
+			otlploggrpc.WithEndpointURL(cfg.OtlpgRPCURL),
+			otlploggrpc.WithCompressor(cfg.OtlpCompression),
+			otlploggrpc.WithReconnectionPeriod(time.Duration(cfg.OtlpgRPCReconnectionPeriod) * time.Second),
+			otlploggrpc.WithRetry(otlploggrpc.RetryConfig{
+				Enabled:         true,
+				InitialInterval: time.Duration(cfg.OtlpInitialInterval) * time.Second,
+				MaxInterval:     time.Duration(cfg.OtlpMaxInterval) * time.Second,
+				MaxElapsedTime:  time.Duration(cfg.OtlpMaxElapsedTime) * time.Second,
+			}),
+		}
+
+		if cfg.OtlpTLSCertFile != "" && cfg.OtlpTLSKeyFile != "" {
+			certificate, err := tls.LoadX509KeyPair(cfg.OtlpTLSCertFile, cfg.OtlpTLSKeyFile)
+			if err != nil {
+				slog.Error(fmt.Sprintf("failed to load TLS certificate and key: %v", err))
+				return nil, err
+			}
+
+			certPool := x509.NewCertPool()
+			ca, err := os.ReadFile(cfg.OtlpTLSCertFile)
+			if err != nil {
+				slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
+				return nil, err
+			}
+
+			if ok := certPool.AppendCertsFromPEM(ca); !ok {
+				slog.Error("failed to append CA certificate to cert pool")
+				return nil, fmt.Errorf("failed to append CA certificate to cert pool")
+			}
+
+			creds := credentials.NewTLS(&tls.Config{
+				Certificates: []tls.Certificate{certificate},
+				RootCAs:      certPool,
+			})
+
+			rpcOptions = append(rpcOptions, otlploggrpc.WithTLSCredentials(creds))
+		}
+
+		exporter, err = otlploggrpc.New(ctx, rpcOptions...)
 		if err != nil {
-			slog.Error(fmt.Sprintf("failed to load TLS certificate and key: %v", err))
+			slog.Error(fmt.Sprintf("failure creating gRPC logger with options %v; error: %v", opts, err))
 			return nil, err
 		}
+	} else if cfg.OtlpHTTPURL != "" {
+		httpOptions := []otlploghttp.Option{
+			otlploghttp.WithEndpointURL(cfg.OtlpHTTPURL),
+			otlploghttp.WithRetry(otlploghttp.RetryConfig{
+				Enabled:         true,
+				InitialInterval: time.Duration(cfg.OtlpInitialInterval) * time.Second,
+				MaxInterval:     time.Duration(cfg.OtlpMaxInterval) * time.Second,
+				MaxElapsedTime:  time.Duration(cfg.OtlpMaxElapsedTime) * time.Second,
+			}),
+		}
+		if cfg.OtlpCompression == "gzip" {
+			httpOptions = append(httpOptions, otlploghttp.WithCompression(otlploghttp.GzipCompression))
+		}
 
-		certPool := x509.NewCertPool()
-		ca, err := os.ReadFile(cfg.OtlpgRPCTLSCertFile)
+		if cfg.OtlpTLSCertFile != "" && cfg.OtlpTLSKeyFile != "" {
+			certificate, err := tls.LoadX509KeyPair(cfg.OtlpTLSCertFile, cfg.OtlpTLSKeyFile)
+			if err != nil {
+				slog.Error(fmt.Sprintf("failed to load TLS certificate and key: %v", err))
+				return nil, err
+			}
+
+			certPool := x509.NewCertPool()
+			ca, err := os.ReadFile(cfg.OtlpTLSCertFile)
+			if err != nil {
+				slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
+				return nil, err
+			}
+
+			if ok := certPool.AppendCertsFromPEM(ca); !ok {
+				slog.Error("failed to append CA certificate to cert pool")
+				return nil, fmt.Errorf("failed to append CA certificate to cert pool")
+			}
+
+			httpOptions = append(httpOptions, otlploghttp.WithTLSClientConfig(&tls.Config{
+				Certificates: []tls.Certificate{certificate},
+				RootCAs:      certPool,
+			}))
+		}
+
+		exporter, err = otlploghttp.New(ctx, httpOptions...)
 		if err != nil {
-			slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
+			slog.Error(fmt.Sprintf("failure creating HTTP logger with options %v; error: %v", opts, err))
 			return nil, err
 		}
-
-		if ok := certPool.AppendCertsFromPEM(ca); !ok {
-			slog.Error("failed to append CA certificate to cert pool")
-			return nil, fmt.Errorf("failed to append CA certificate to cert pool")
-		}
-
-		creds := credentials.NewTLS(&tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			RootCAs:      certPool,
-		})
-
-		rpcOptions = append(rpcOptions, otlploggrpc.WithTLSCredentials(creds))
-	}
-
-	exporter, err := otlploggrpc.New(ctx, rpcOptions...)
-	if err != nil {
-		slog.Error(fmt.Sprintf("failure creating logger with options %v; error: %v", opts, err))
-		return nil, err
+	} else {
+		return nil, fmt.Errorf("no valid OTLP endpoint provided")
 	}
 
 	providerResources, err := resource.Merge(
