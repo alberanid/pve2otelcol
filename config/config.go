@@ -82,7 +82,7 @@ func ParseArgs() *Config {
 	c := Config{}
 	flag.StringVar(&c.OtlpLoggerName, "otlp-logger-name", DEFAULT_OTLP_LOGGER_NAME, "OpenTelemetry logger name")
 
-	flag.StringVar(&c.OtlpgRPCURL, "otlp-exporter", DEFAULT_OTLP_EXPORTER, "OpenTelemetry exporter (\"grpc\" or \"http\")")
+	flag.StringVar(&c.OtlpExporter, "otlp-exporter", DEFAULT_OTLP_EXPORTER, "OpenTelemetry exporter (\"grpc\" or \"http\")")
 	flag.StringVar(&c.OtlpgRPCURL, "otlp-grpc-url", DEFAULT_OTLP_GRPC_URL, "OpenTelemetry gRPC URL")
 	flag.StringVar(&c.OtlpHTTPURL, "otlp-http-url", DEFAULT_OTLP_HTTP_URL, "OpenTelemetry HTTP URL")
 
