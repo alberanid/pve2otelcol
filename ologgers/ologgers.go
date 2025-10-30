@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -113,8 +115,9 @@ func str2time(s string) (time.Time, error) {
 
 // Object used to log to an OpenTelemetry instance
 type OLogger struct {
-	Logger otellog.Logger
-	Ctx    context.Context
+	Logger   otellog.Logger
+	Ctx      context.Context
+	Provider *sdklog.LoggerProvider
 }
 
 // Options of an OLogger instance
@@ -242,10 +245,28 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	)
 	logger := provider.Logger(cfg.OtlpLoggerName)
 
-	return &OLogger{
-		Logger: logger,
-		Ctx:    ctx,
-	}, nil
+	ol := &OLogger{
+		Logger:   logger,
+		Ctx:      ctx,
+		Provider: provider,
+	}
+
+	// Ensure we flush pending logs on application shutdown signals.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		sig := <-sigCh
+		slog.Info("received signal, shutting down otel logger to flush pending logs", "signal", sig)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ol.Provider.Shutdown(shutdownCtx); err != nil {
+			slog.Error(fmt.Sprintf("error shutting down otel logger: %v", err))
+		}
+		// exit to honor the signal and ensure process termination after flushing
+		os.Exit(0)
+	}()
+
+	return ol, nil
 }
 
 // Emit a Record
@@ -259,32 +280,33 @@ func (o *OLogger) Log(i interface{}) {
 	record := otellog.Record{}
 	record.SetBody(body)
 	for _, kv := range body.AsMap() {
-		if kv.Key == "_SOURCE_REALTIME_TIMESTAMP" {
+		switch kv.Key {
+		case "_SOURCE_REALTIME_TIMESTAMP":
 			tm, err := str2time(kv.Value.AsString())
-			if err != nil {
+			if err == nil {
 				record.SetTimestamp(tm)
 			}
-		} else if kv.Key == "__REALTIME_TIMESTAMP" {
+		case "__REALTIME_TIMESTAMP":
 			tm, err := str2time(kv.Value.AsString())
-			if err != nil {
+			if err == nil {
 				record.SetObservedTimestamp(tm)
 			}
-		} else if kv.Key == "PRIORITY" {
+		case "PRIORITY":
 			if severity, ok := prio2severity[kv.Value.AsString()]; ok {
 				record.SetSeverity(severity)
 			}
 			if severityTxt, ok := prio2string[kv.Value.AsString()]; ok {
 				record.SetSeverityText(severityTxt)
 			}
-		} else if kv.Key == "_PID" {
-			i, err := strconv.Atoi(kv.Value.AsString())
+		case "_PID":
+			pid, err := strconv.Atoi(kv.Value.AsString())
 			if err == nil {
 				record.AddAttributes(otellog.KeyValue{
 					Key:   "pid",
-					Value: otellog.IntValue(i),
+					Value: otellog.IntValue(pid),
 				})
 			}
-		} else if kv.Key == "_COMM" {
+		case "_COMM":
 			record.AddAttributes(otellog.KeyValue{
 				Key:   "command",
 				Value: otellog.StringValue(kv.Value.AsString()),
@@ -292,4 +314,12 @@ func (o *OLogger) Log(i interface{}) {
 		}
 	}
 	o.LogRecord(record)
+}
+
+// Shutdown flushes pending logs and shuts down the logger provider.
+func (o *OLogger) Shutdown(ctx context.Context) error {
+	if o.Provider == nil {
+		return nil
+	}
+	return o.Provider.Shutdown(ctx)
 }
