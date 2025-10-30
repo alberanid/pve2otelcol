@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -39,6 +40,7 @@ type VMs map[int]*VM
 type Pve struct {
 	cfg        *config.Config
 	knownVMs   VMs
+	knownVMsMu sync.RWMutex
 	ticker     *time.Ticker
 	quitTicker *chan bool
 }
@@ -296,52 +298,92 @@ func (p *Pve) CurrentVMs() VMs {
 
 // add the received VM to the list of known VMs, creating its logger service if needed
 func (p *Pve) UpdateVM(vm *VM) *VM {
-	if _, ok := p.knownVMs[vm.Id]; !ok {
-		slog.Debug(fmt.Sprintf("adding newly found VM %s/%d", vm.Type, vm.Id))
-		logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
-			ServiceName: vm.Name,
-			ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
-		})
-		if err != nil {
-			slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
-		}
-		vm.Logger = logger
-		// store the VM in the list of monitored VMs
-		p.knownVMs[vm.Id] = vm
+	// fast path: check if already present
+	p.knownVMsMu.RLock()
+	existing, ok := p.knownVMs[vm.Id]
+	p.knownVMsMu.RUnlock()
+	if ok {
+		return existing
 	}
+
+	// create logger without holding the map lock
+	logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
+		ServiceName: vm.Name,
+		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
+	})
+	if err != nil {
+		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
+	}
+	vm.Logger = logger
+
+	// insert if still not present (double-checked locking)
+	p.knownVMsMu.Lock()
+	defer p.knownVMsMu.Unlock()
+	if existing, ok := p.knownVMs[vm.Id]; ok {
+		// someone else added it while we were creating logger
+		return existing
+	}
+	p.knownVMs[vm.Id] = vm
 	return vm
 }
 
 // run the monitoring process of a VM
 func (p *Pve) StartVMMonitoring(vm *VM) {
+	// ensure VM is known (and logger created) first
 	p.UpdateVM(vm)
-	if vm.Logger != nil && !vm.Running {
-		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", vm.Type, vm.Id))
-		vm.Running = true
-		go p.RunKeptAliveProcess(vm, false)
+
+	// attempt to start monitoring only if not already running
+	p.knownVMsMu.Lock()
+	stored, ok := p.knownVMs[vm.Id]
+	if ok && stored.Logger != nil && !stored.Running {
+		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", stored.Type, stored.Id))
+		stored.Running = true
+		p.knownVMsMu.Unlock()
+		go p.RunKeptAliveProcess(stored, false)
+		return
 	}
+	p.knownVMsMu.Unlock()
 }
 
 // stop the monitoring process of a VM
 func (p *Pve) StopVMMonitoring(id int) {
-	if vm, ok := p.knownVMs[id]; ok {
-		if vm.StopProcess != nil {
-			slog.Debug(fmt.Sprintf("stop monitoring VM %s/%d", vm.Type, vm.Id))
-			vm.StopProcess()
-		}
-		vm.Running = false
+	// obtain vm pointer under read lock, then operate without holding the lock
+	p.knownVMsMu.RLock()
+	vm, ok := p.knownVMs[id]
+	p.knownVMsMu.RUnlock()
+	if !ok {
+		return
 	}
+	if vm.StopProcess != nil {
+		slog.Debug(fmt.Sprintf("stop monitoring VM %s/%d", vm.Type, vm.Id))
+		vm.StopProcess()
+	}
+	// mark as not running
+	p.knownVMsMu.Lock()
+	if v, ok := p.knownVMs[id]; ok {
+		v.Running = false
+	}
+	p.knownVMsMu.Unlock()
 }
 
 // remove a VM from the list of known VMs
 func (p *Pve) RemoveVM(id int) {
+	// Read VM description under lock for logging, but don't hold lock while stopping
+	p.knownVMsMu.RLock()
 	vmDesc := fmt.Sprintf("%d", id)
 	if vm, ok := p.knownVMs[id]; ok {
 		vmDesc = fmt.Sprintf("%s/%d", vm.Type, id)
 	}
+	p.knownVMsMu.RUnlock()
+
 	slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
+	// stop monitoring (safe: StopVMMonitoring will fetch vm pointer under lock)
 	p.StopVMMonitoring(id)
+
+	// finally remove from map
+	p.knownVMsMu.Lock()
 	delete(p.knownVMs, id)
+	p.knownVMsMu.Unlock()
 }
 
 // refresh the map of running VMs
@@ -352,11 +394,14 @@ func (p *Pve) RefreshVMsMonitoring() {
 	}
 
 	remove := []int{}
+	p.knownVMsMu.RLock()
 	for id, vm := range p.knownVMs {
 		if _, ok := vms[id]; !ok {
 			remove = append(remove, vm.Id)
 		}
 	}
+	p.knownVMsMu.RUnlock()
+
 	for _, id := range remove {
 		p.RemoveVM(id)
 	}
@@ -402,9 +447,22 @@ func (p *Pve) Start() {
 // stop all running monitoring processes
 func (p *Pve) Stop() {
 	slog.Info("stop monitoring")
-	p.ticker.Stop()
-	*p.quitTicker <- true
+	if p.ticker != nil {
+		p.ticker.Stop()
+	}
+	if p.quitTicker != nil && *p.quitTicker != nil {
+		*p.quitTicker <- true
+	}
+
+	// collect ids first under lock to avoid holding lock while removing
+	ids := []int{}
+	p.knownVMsMu.RLock()
 	for id := range p.knownVMs {
+		ids = append(ids, id)
+	}
+	p.knownVMsMu.RUnlock()
+
+	for _, id := range ids {
 		p.RemoveVM(id)
 	}
 }
