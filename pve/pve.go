@@ -42,7 +42,7 @@ type Pve struct {
 	knownVMs   VMs
 	knownVMsMu sync.RWMutex
 	ticker     *time.Ticker
-	quitTicker *chan bool
+	quitTicker chan bool
 }
 
 // return a Pve instance.
@@ -368,7 +368,6 @@ func (p *Pve) StopVMMonitoring(id int) {
 
 // remove a VM from the list of known VMs
 func (p *Pve) RemoveVM(id int) {
-	// Read VM description under lock for logging, but don't hold lock while stopping
 	p.knownVMsMu.RLock()
 	vmDesc := fmt.Sprintf("%d", id)
 	if vm, ok := p.knownVMs[id]; ok {
@@ -377,10 +376,8 @@ func (p *Pve) RemoveVM(id int) {
 	p.knownVMsMu.RUnlock()
 
 	slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
-	// stop monitoring (safe: StopVMMonitoring will fetch vm pointer under lock)
 	p.StopVMMonitoring(id)
 
-	// finally remove from map
 	p.knownVMsMu.Lock()
 	delete(p.knownVMs, id)
 	p.knownVMsMu.Unlock()
@@ -408,19 +405,17 @@ func (p *Pve) RefreshVMsMonitoring() {
 }
 
 func (p *Pve) periodicRefresh() {
-	// Run the first refresh right now
 	p.RefreshVMsMonitoring()
 	if p.cfg.RefreshInterval == 0 {
-		// no refresh: do not monitor for new/vanished VMs
 		return
 	}
 	p.ticker = time.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
 	quitTicker := make(chan bool)
-	p.quitTicker = &quitTicker
+	p.quitTicker = quitTicker
 	go func() {
 		for {
 			select {
-			case <-*p.quitTicker:
+			case <-p.quitTicker:
 				// was asked to stop
 				return
 			case <-p.ticker.C:
@@ -450,8 +445,8 @@ func (p *Pve) Stop() {
 	if p.ticker != nil {
 		p.ticker.Stop()
 	}
-	if p.quitTicker != nil && *p.quitTicker != nil {
-		*p.quitTicker <- true
+	if p.quitTicker != nil {
+		p.quitTicker <- true
 	}
 
 	// collect ids first under lock to avoid holding lock while removing
