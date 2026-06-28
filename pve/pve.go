@@ -170,6 +170,12 @@ func (p *Pve) pveSelfMonitoring() {
 	go p.RunKeptAliveProcess(&vm, true)
 }
 
+// check whether journalctl is available inside an LXC container
+func (p *Pve) lxcHasJournalctl(strId string) bool {
+	err := exec.Command("pct", "exec", strId, "--", "which", "journalctl").Run()
+	return err == nil
+}
+
 // check id against the include and exclude lists
 func (p *Pve) checkLists(id int) bool {
 	if len(p.cfg.MonitorExclude) > 0 && slices.Contains(p.cfg.MonitorExclude, id) {
@@ -207,6 +213,10 @@ func (p *Pve) CurrentLXCs() VMs {
 			continue
 		}
 		if !p.checkLists(id) {
+			continue
+		}
+		if !p.lxcHasJournalctl(strId) {
+			slog.Debug(fmt.Sprintf("skipping lxc/%d: journalctl not found", id))
 			continue
 		}
 		vms[id] = &VM{
