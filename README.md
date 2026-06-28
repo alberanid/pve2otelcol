@@ -468,6 +468,6 @@ Query:
 
 ## Copyright and license
 
-2024 Davide Alberani <da@mimante.net>
+2024-2026 Davide Alberani <da@mimante.net>
 
 Released under the Apache 2 license.

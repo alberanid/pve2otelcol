@@ -4,4 +4,4 @@ package version
 version of the pv2otelcol program.
 */
 
-const VERSION = "0.0.9"
+const VERSION = "0.1.0"
