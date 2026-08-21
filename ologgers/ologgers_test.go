@@ -1,11 +1,23 @@
 package ologgers
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
 	"math"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alberanid/pve2otelcol/config"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/embedded"
 )
@@ -157,4 +169,158 @@ func TestLogSetsOnlySuccessfullyParsedTimestamps(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewTLSConfigWithoutTLSFilesUsesExporterDefaults(t *testing.T) {
+	tlsConfig, err := newTLSConfig(&config.Config{})
+	if err != nil {
+		t.Fatalf("newTLSConfig() error = %v, want nil", err)
+	}
+	if tlsConfig != nil {
+		t.Fatalf("newTLSConfig() = %#v, want nil", tlsConfig)
+	}
+}
+
+func TestNewTLSConfigAppendsCAtoSystemRoots(t *testing.T) {
+	additionalPEM, additionalCert, _ := testCertificate(t, true)
+	systemPEM, systemCert, _ := testCertificate(t, true)
+	caPath := writeTLSFile(t, "additional-ca.pem", additionalPEM)
+
+	systemRoots := x509.NewCertPool()
+	if !systemRoots.AppendCertsFromPEM(systemPEM) {
+		t.Fatal("failed to prepare system root pool")
+	}
+	tlsConfig, err := newTLSConfigWithSystemRoots(&config.Config{OtlpTLSCAFile: caPath}, func() (*x509.CertPool, error) {
+		return systemRoots, nil
+	})
+	if err != nil {
+		t.Fatalf("newTLSConfigWithSystemRoots() error = %v, want nil", err)
+	}
+	if tlsConfig.RootCAs == nil {
+		t.Fatal("TLS RootCAs = nil, want system and additional roots")
+	}
+	assertPoolContainsSubject(t, tlsConfig.RootCAs, systemCert.RawSubject)
+	assertPoolContainsSubject(t, tlsConfig.RootCAs, additionalCert.RawSubject)
+}
+
+func TestNewTLSConfigUsesClientCertificateOnlyAsIdentity(t *testing.T) {
+	certPEM, _, keyPEM := testCertificate(t, false)
+	certPath := writeTLSFile(t, "client.pem", certPEM)
+	keyPath := writeTLSFile(t, "client-key.pem", keyPEM)
+
+	tlsConfig, err := newTLSConfigWithSystemRoots(&config.Config{
+		OtlpTLSCertFile: certPath,
+		OtlpTLSKeyFile:  keyPath,
+	}, func() (*x509.CertPool, error) {
+		t.Fatal("system roots should not be materialized when no additional CA is configured")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("newTLSConfigWithSystemRoots() error = %v, want nil", err)
+	}
+	if len(tlsConfig.Certificates) != 1 {
+		t.Fatalf("TLS client certificates = %d, want 1", len(tlsConfig.Certificates))
+	}
+	if tlsConfig.RootCAs != nil {
+		t.Fatal("TLS RootCAs is non-nil, want the standard system-root behavior")
+	}
+}
+
+func TestNewTLSConfigDoesNotExposeCredentialPaths(t *testing.T) {
+	secretDir := filepath.Join(t.TempDir(), "private-collector-credentials")
+	tests := []struct {
+		name string
+		cfg  config.Config
+	}{
+		{
+			name: "missing CA",
+			cfg:  config.Config{OtlpTLSCAFile: filepath.Join(secretDir, "internal-ca.pem")},
+		},
+		{
+			name: "missing client certificate",
+			cfg: config.Config{
+				OtlpTLSCertFile: filepath.Join(secretDir, "client.pem"),
+				OtlpTLSKeyFile:  filepath.Join(secretDir, "client-key.pem"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newTLSConfigWithSystemRoots(&tt.cfg, func() (*x509.CertPool, error) {
+				return x509.NewCertPool(), nil
+			})
+			if err == nil {
+				t.Fatal("newTLSConfigWithSystemRoots() error = nil, want non-nil")
+			}
+			if strings.Contains(err.Error(), secretDir) {
+				t.Fatalf("error exposes credential directory: %q", err)
+			}
+		})
+	}
+}
+
+func TestNewTLSConfigReportsSystemRootFailure(t *testing.T) {
+	wantErr := errors.New("system root failure")
+	_, err := newTLSConfigWithSystemRoots(&config.Config{OtlpTLSCAFile: "unused"}, func() (*x509.CertPool, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("newTLSConfigWithSystemRoots() error = %v, want wrapped %v", err, wantErr)
+	}
+}
+
+func testCertificate(t *testing.T, isCA bool) ([]byte, *x509.Certificate, []byte) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: t.Name()},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	if isCA {
+		template.KeyUsage |= x509.KeyUsageCertSign
+	} else {
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatalf("create test certificate: %v", err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse test certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("marshal test key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), certificate,
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+func writeTLSFile(t *testing.T, name string, contents []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatalf("write TLS fixture: %v", err)
+	}
+	return path
+}
+
+func assertPoolContainsSubject(t *testing.T, pool *x509.CertPool, want []byte) {
+	t.Helper()
+	for _, subject := range pool.Subjects() {
+		if bytes.Equal(subject, want) {
+			return
+		}
+	}
+	t.Fatalf("certificate pool does not contain subject %x", want)
 }

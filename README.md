@@ -36,6 +36,34 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 **pve2otelcol** has numerous other command line options, see `./pve2otelcol --help` for more information. The defaults should be reasonable values in most of the cases.
 
+### TLS
+
+Use an `https` endpoint to verify the collector with the host's system CA certificates:
+
+```sh
+./pve2otelcol --otlp-grpc-url https://collector.example:4317
+```
+
+For a collector certificate issued by a private CA, append that CA to the system trust pool with `--otlp-tls-ca-file`:
+
+```sh
+./pve2otelcol \
+  --otlp-grpc-url https://collector.example:4317 \
+  --otlp-tls-ca-file /etc/pve2otelcol/collector-ca.pem
+```
+
+If the collector requires mutual TLS, also provide the client identity certificate and its matching private key. These files are used only for client authentication; the client certificate is not treated as a server trust root.
+
+```sh
+./pve2otelcol \
+  --otlp-grpc-url https://collector.example:4317 \
+  --otlp-tls-ca-file /etc/pve2otelcol/collector-ca.pem \
+  --otlp-tls-cert-file /etc/pve2otelcol/client.pem \
+  --otlp-tls-key-file /etc/pve2otelcol/client-key.pem
+```
+
+The certificate and key options must be supplied together, and all TLS file options require the selected gRPC or HTTP endpoint to use `https`.
+
 Journal cursors are checkpointed per source under `/var/lib/pve2otelcol/cursors` by default. When a monitoring command restarts, the saved cursor is passed to `journalctl --after-cursor`, so records written during the restart are replayed instead of skipped. Checkpoints advance only after a record has been handed to the OpenTelemetry logger; after an abrupt process or host failure, a short suffix may therefore be delivered more than once. Use `--cursor-dir` to select another state directory, or pass an empty value to disable persistence.
 
 ### Systemd unit

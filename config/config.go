@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -36,6 +38,7 @@ type Config struct {
 	OtlpExporter               string
 	OtlpgRPCURL                string
 	OtlpHTTPURL                string
+	OtlpTLSCAFile              string
 	OtlpTLSCertFile            string
 	OtlpTLSKeyFile             string
 	OtlpCompression            string
@@ -88,8 +91,9 @@ func ParseArgs() *Config {
 	flag.StringVar(&c.OtlpgRPCURL, "otlp-grpc-url", DEFAULT_OTLP_GRPC_URL, "OpenTelemetry gRPC URL")
 	flag.StringVar(&c.OtlpHTTPURL, "otlp-http-url", DEFAULT_OTLP_HTTP_URL, "OpenTelemetry HTTP URL")
 
-	flag.StringVar(&c.OtlpTLSCertFile, "otlp-tls-cert-file", "", "Path to the TLS certificate file")
-	flag.StringVar(&c.OtlpTLSKeyFile, "otlp-tls-key-file", "", "Path to the TLS key file")
+	flag.StringVar(&c.OtlpTLSCAFile, "otlp-tls-ca-file", "", "Path to an additional CA certificate file")
+	flag.StringVar(&c.OtlpTLSCertFile, "otlp-tls-cert-file", "", "Path to the mutual TLS client certificate file")
+	flag.StringVar(&c.OtlpTLSKeyFile, "otlp-tls-key-file", "", "Path to the mutual TLS client key file")
 	flag.StringVar(&c.OtlpCompression, "otlp-compression", DEFAULT_OTLP_COMPRESSION,
 		"OpenTelemetry compression algorithm (\"gzip\" or \"none\")")
 	flag.IntVar(&c.OtlpInitialInterval, "otlp-initial-interval",
@@ -141,9 +145,8 @@ func ParseArgs() *Config {
 		os.Exit(1)
 	}
 
-	if (c.OtlpTLSCertFile != "" || c.OtlpTLSKeyFile != "") &&
-		!(c.OtlpTLSCertFile != "" && c.OtlpTLSKeyFile != "") {
-		slog.Error("otlp-grpc-tls-cert-file and otlp-grpc-tls-key-file must both be specified")
+	if err := c.validateTLS(); err != nil {
+		slog.Error(err.Error())
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -208,4 +211,26 @@ func ParseArgs() *Config {
 	}
 
 	return &c
+}
+
+// validateTLS checks relationships between TLS credentials and the selected
+// exporter endpoint. Endpoint syntax beyond the scheme is validated separately.
+func (c *Config) validateTLS() error {
+	if (c.OtlpTLSCertFile == "") != (c.OtlpTLSKeyFile == "") {
+		return errors.New("otlp-tls-cert-file and otlp-tls-key-file must both be specified")
+	}
+
+	if c.OtlpTLSCAFile == "" && c.OtlpTLSCertFile == "" {
+		return nil
+	}
+
+	endpoint := c.OtlpgRPCURL
+	if c.OtlpExporter == "http" {
+		endpoint = c.OtlpHTTPURL
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return errors.New("OTLP TLS files require the selected endpoint URL to use https")
+	}
+	return nil
 }

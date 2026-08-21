@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -127,31 +128,10 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	var exporter sdklog.Exporter
 	var err error
 
-	withTLS := cfg.OtlpTLSCertFile != "" && cfg.OtlpTLSKeyFile != ""
-	tlsConfig := tls.Config{}
-	if withTLS {
-		certificate, err := tls.LoadX509KeyPair(cfg.OtlpTLSCertFile, cfg.OtlpTLSKeyFile)
-		if err != nil {
-			slog.Error(fmt.Sprintf("failed to load TLS certificate and key: %v", err))
-			return nil, err
-		}
-
-		certPool := x509.NewCertPool()
-		ca, err := os.ReadFile(cfg.OtlpTLSCertFile)
-		if err != nil {
-			slog.Error(fmt.Sprintf("failed to read CA certificate: %v", err))
-			return nil, err
-		}
-
-		if ok := certPool.AppendCertsFromPEM(ca); !ok {
-			slog.Error("failed to append CA certificate to cert pool")
-			return nil, fmt.Errorf("failed to append CA certificate to cert pool")
-		}
-
-		tlsConfig = tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			RootCAs:      certPool,
-		}
+	tlsConfig, err := newTLSConfig(cfg)
+	if err != nil {
+		slog.Error("failed to configure OTLP TLS", "error", err)
+		return nil, err
 	}
 
 	if cfg.OtlpExporter == "grpc" {
@@ -169,8 +149,8 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 			otlploggrpc.WithTimeout(time.Duration(cfg.OtlpTimeout) * time.Millisecond),
 		}
 
-		if withTLS {
-			creds := credentials.NewTLS(&tlsConfig)
+		if tlsConfig != nil {
+			creds := credentials.NewTLS(tlsConfig)
 			rpcOptions = append(rpcOptions, otlploggrpc.WithTLSCredentials(creds))
 		}
 
@@ -194,8 +174,8 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 			httpOptions = append(httpOptions, otlploghttp.WithCompression(otlploghttp.GzipCompression))
 		}
 
-		if withTLS {
-			httpOptions = append(httpOptions, otlploghttp.WithTLSClientConfig(&tlsConfig))
+		if tlsConfig != nil {
+			httpOptions = append(httpOptions, otlploghttp.WithTLSClientConfig(tlsConfig))
 		}
 
 		exporter, err = otlploghttp.New(ctx, httpOptions...)
@@ -257,6 +237,56 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		Ctx:      ctx,
 		Provider: provider,
 	}, nil
+}
+
+func newTLSConfig(cfg *config.Config) (*tls.Config, error) {
+	return newTLSConfigWithSystemRoots(cfg, x509.SystemCertPool)
+}
+
+func newTLSConfigWithSystemRoots(cfg *config.Config, systemRoots func() (*x509.CertPool, error)) (*tls.Config, error) {
+	if cfg.OtlpTLSCAFile == "" && cfg.OtlpTLSCertFile == "" && cfg.OtlpTLSKeyFile == "" {
+		return nil, nil
+	}
+
+	tlsConfig := &tls.Config{}
+	if cfg.OtlpTLSCAFile != "" {
+		roots, err := systemRoots()
+		if err != nil {
+			return nil, fmt.Errorf("load system CA certificates: %w", err)
+		}
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
+		caPEM, err := os.ReadFile(cfg.OtlpTLSCAFile)
+		if err != nil {
+			return nil, errors.New("read additional OTLP CA certificate")
+		}
+		if ok := roots.AppendCertsFromPEM(caPEM); !ok {
+			return nil, errors.New("parse additional OTLP CA certificate")
+		}
+		tlsConfig.RootCAs = roots
+	}
+
+	if cfg.OtlpTLSCertFile != "" || cfg.OtlpTLSKeyFile != "" {
+		if cfg.OtlpTLSCertFile == "" || cfg.OtlpTLSKeyFile == "" {
+			return nil, errors.New("both OTLP TLS client certificate and key are required")
+		}
+		certPEM, err := os.ReadFile(cfg.OtlpTLSCertFile)
+		if err != nil {
+			return nil, errors.New("read OTLP TLS client certificate")
+		}
+		keyPEM, err := os.ReadFile(cfg.OtlpTLSKeyFile)
+		if err != nil {
+			return nil, errors.New("read OTLP TLS client key")
+		}
+		certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("parse OTLP TLS client certificate and key: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+
+	return tlsConfig, nil
 }
 
 // Emit a Record
