@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -12,11 +13,11 @@ import (
 
 func main() {
 	cfg := config.ParseArgs()
-	done := make(chan bool, 1)
-	stopSigs := make(chan os.Signal, 1)
-	signal.Notify(stopSigs, syscall.SIGINT, syscall.SIGTERM)
+	stopCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
 	refreshSig := make(chan os.Signal, 1)
 	signal.Notify(refreshSig, syscall.SIGUSR1)
+	defer signal.Stop(refreshSig)
 
 	p := pve.New(cfg)
 	if err := p.Start(); err != nil {
@@ -24,16 +25,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	go func() {
-		<-stopSigs
-		p.Stop()
-		done <- true
-	}()
-	go func() {
-		for {
-			<-refreshSig
+	for {
+		select {
+		case <-stopCtx.Done():
+			p.Stop()
+			return
+		case <-refreshSig:
 			p.RefreshVMsMonitoring()
 		}
-	}()
-	<-done
+	}
 }

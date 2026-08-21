@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,16 +14,64 @@ import (
 )
 
 type loggerFactoryStub struct {
-	logger  *ologgers.OLogger
-	err     error
-	calls   int
-	options []ologgers.OLoggerOptions
+	logger      *ologgers.OLogger
+	err         error
+	calls       int
+	options     []ologgers.OLoggerOptions
+	newLoggerFn func(ologgers.OLoggerOptions) (*ologgers.OLogger, error)
 }
 
 func (s *loggerFactoryStub) newLogger(_ *config.Config, opts ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
 	s.calls++
 	s.options = append(s.options, opts)
+	if s.newLoggerFn != nil {
+		return s.newLoggerFn(opts)
+	}
 	return s.logger, s.err
+}
+
+type loggerShutdownSpy struct {
+	mu                   sync.Mutex
+	calls                map[*ologgers.OLogger]int
+	allContextsDeadlined bool
+}
+
+func newLoggerShutdownSpy() *loggerShutdownSpy {
+	return &loggerShutdownSpy{
+		calls:                make(map[*ologgers.OLogger]int),
+		allContextsDeadlined: true,
+	}
+}
+
+func (s *loggerShutdownSpy) shutdown(ctx context.Context, logger *ologgers.OLogger) error {
+	_, hasDeadline := ctx.Deadline()
+	s.mu.Lock()
+	s.calls[logger]++
+	s.allContextsDeadlined = s.allContextsDeadlined && hasDeadline
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *loggerShutdownSpy) count(logger *ologgers.OLogger) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[logger]
+}
+
+func (s *loggerShutdownSpy) total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, calls := range s.calls {
+		total += calls
+	}
+	return total
+}
+
+func (s *loggerShutdownSpy) contextsHaveDeadlines() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.allContextsDeadlined
 }
 
 type monitorCall struct {
@@ -96,16 +145,24 @@ func waitForMonitorStopped(t *testing.T, vm *VM) error {
 func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 	loggerError := errors.New("exporter initialization failed")
 	tests := []struct {
-		name       string
-		logger     *ologgers.OLogger
-		loggerErr  error
-		wantErr    error
-		wantErrMsg string
+		name         string
+		logger       *ologgers.OLogger
+		loggerErr    error
+		wantErr      error
+		wantErrMsg   string
+		wantShutdown int
 	}{
 		{
 			name:      "logger factory returns error",
 			loggerErr: loggerError,
 			wantErr:   loggerError,
+		},
+		{
+			name:         "logger factory returns partial logger and error",
+			logger:       &ologgers.OLogger{},
+			loggerErr:    loggerError,
+			wantErr:      loggerError,
+			wantShutdown: 1,
 		},
 		{
 			name:       "logger factory returns nil logger",
@@ -116,6 +173,8 @@ func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p, loggerStub, runnerStub := newTestPve(t)
+			shutdownSpy := newLoggerShutdownSpy()
+			p.shutdownLogger = shutdownSpy.shutdown
 			loggerStub.logger = tt.logger
 			loggerStub.err = tt.loggerErr
 
@@ -134,6 +193,9 @@ func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 			}
 			if calls := len(runnerStub.calls); calls != 0 {
 				t.Errorf("monitor runner calls = %d, want 0", calls)
+			}
+			if calls := shutdownSpy.count(tt.logger); calls != tt.wantShutdown {
+				t.Errorf("logger shutdown calls = %d, want %d", calls, tt.wantShutdown)
 			}
 		})
 	}
@@ -391,9 +453,61 @@ func TestDryRunDoesNotCreateLoggersOrMonitorState(t *testing.T) {
 	}
 }
 
+func TestStopWaitsForInFlightLoggerCreation(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+	logger := &ologgers.OLogger{}
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	p.newLogger = func(*config.Config, ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
+		close(factoryEntered)
+		<-releaseFactory
+		return logger, nil
+	}
+
+	startReturned := make(chan struct{})
+	go func() {
+		p.StartVMMonitoring(&VM{Id: 109, Name: "starting", Type: "lxc", MonitorCmd: "journalctl"})
+		close(startReturned)
+	}()
+	select {
+	case <-factoryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("logger factory did not start")
+	}
+	stopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+		t.Fatal("Stop returned while logger creation was in progress")
+	default:
+	}
+
+	close(releaseFactory)
+	select {
+	case <-startReturned:
+	case <-time.After(time.Second):
+		t.Fatal("StartVMMonitoring did not return")
+	}
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return after logger creation completed")
+	}
+	if calls := shutdownSpy.count(logger); calls != 1 {
+		t.Errorf("logger shutdown calls = %d, want 1", calls)
+	}
+}
+
 func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 	p, loggerStub, runnerStub := newTestPve(t)
 	loggerStub.logger = &ologgers.OLogger{}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
 	receivedCancellation := make(chan struct{})
 	releaseRunner := make(chan struct{})
 	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
@@ -422,6 +536,9 @@ func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 	if !stillKnown {
 		t.Fatal("VM state was deleted before the monitor exited")
 	}
+	if calls := shutdownSpy.count(loggerStub.logger); calls != 0 {
+		t.Fatalf("logger shutdown calls before monitor exit = %d, want 0", calls)
+	}
 	select {
 	case <-removeReturned:
 		t.Fatal("RemoveVM returned before the monitor exited")
@@ -440,11 +557,21 @@ func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 	if stillKnown {
 		t.Fatal("VM state remains after monitor removal")
 	}
+	if calls := shutdownSpy.count(loggerStub.logger); calls != 1 {
+		t.Errorf("logger shutdown calls = %d, want 1", calls)
+	}
+	if !shutdownSpy.contextsHaveDeadlines() {
+		t.Error("logger shutdown context has no deadline")
+	}
 }
 
 func TestStopCancelsAndWaitsForAllMonitors(t *testing.T) {
 	p, loggerStub, runnerStub := newTestPve(t)
-	loggerStub.logger = &ologgers.OLogger{}
+	loggerStub.newLoggerFn = func(ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
+		return &ologgers.OLogger{}, nil
+	}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
 	cancellations := make(chan int, 2)
 	releaseRunners := make(chan struct{})
 	runnerStub.runFn = func(ctx context.Context, vm *VM, _ bool) error {
@@ -478,12 +605,21 @@ func TestStopCancelsAndWaitsForAllMonitors(t *testing.T) {
 		t.Fatal("Stop returned before all monitors exited")
 	default:
 	}
+	if calls := shutdownSpy.total(); calls != 0 {
+		t.Fatalf("logger shutdown calls before monitors exit = %d, want 0", calls)
+	}
 
 	close(releaseRunners)
 	select {
 	case <-stopReturned:
 	case <-time.After(time.Second):
 		t.Fatal("Stop did not return after all monitors exited")
+	}
+	if calls := shutdownSpy.total(); calls != 2 {
+		t.Errorf("logger shutdown calls = %d, want 2", calls)
+	}
+	if !shutdownSpy.contextsHaveDeadlines() {
+		t.Error("one or more logger shutdown contexts have no deadline")
 	}
 
 	secondStopReturned := make(chan struct{})
@@ -495,5 +631,8 @@ func TestStopCancelsAndWaitsForAllMonitors(t *testing.T) {
 	case <-secondStopReturned:
 	case <-time.After(time.Second):
 		t.Fatal("second Stop call did not return")
+	}
+	if calls := shutdownSpy.total(); calls != 2 {
+		t.Errorf("logger shutdown calls after second Stop = %d, want 2", calls)
 	}
 }

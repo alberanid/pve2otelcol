@@ -29,13 +29,14 @@ type VM struct {
 	MonitorArgs []string
 	Logger      *ologgers.OLogger
 
-	stateMu   sync.Mutex
-	running   bool
-	stopping  bool
-	removed   bool
-	cancel    context.CancelFunc
-	done      chan struct{}
-	lastError error
+	stateMu        sync.Mutex
+	running        bool
+	stopping       bool
+	removed        bool
+	cancel         context.CancelFunc
+	done           chan struct{}
+	lastError      error
+	loggerShutdown bool
 }
 
 // map of VMID to VM information
@@ -47,18 +48,23 @@ type monitorRunner func(context.Context, *VM, bool) error
 
 type processRunner func(context.Context, *VM) error
 
+type loggerShutdown func(context.Context, *ologgers.OLogger) error
+
 var errMonitorExited = errors.New("monitoring process exited unexpectedly")
+
+const loggerShutdownTimeout = 5 * time.Second
 
 // object used to interact with a Proxmox instance
 type Pve struct {
-	cfg        *config.Config
-	knownVMs   VMs
-	knownVMsMu sync.RWMutex
-	ticker     *time.Ticker
-	quitTicker chan bool
-	newLogger  loggerFactory
-	runMonitor monitorRunner
-	runProcess processRunner
+	cfg            *config.Config
+	knownVMs       VMs
+	knownVMsMu     sync.RWMutex
+	ticker         *time.Ticker
+	quitTicker     chan bool
+	newLogger      loggerFactory
+	runMonitor     monitorRunner
+	runProcess     processRunner
+	shutdownLogger loggerShutdown
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -83,7 +89,36 @@ func New(cfg *config.Config) *Pve {
 	}
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
+	pve.shutdownLogger = func(ctx context.Context, logger *ologgers.OLogger) error {
+		return logger.Shutdown(ctx)
+	}
 	return pve
+}
+
+func takeLoggerForShutdown(vm *VM) *ologgers.OLogger {
+	vm.stateMu.Lock()
+	defer vm.stateMu.Unlock()
+	if vm.Logger == nil || vm.loggerShutdown {
+		return nil
+	}
+	vm.loggerShutdown = true
+	return vm.Logger
+}
+
+func (p *Pve) shutdownLoggerWithTimeout(logger *ologgers.OLogger, source string) {
+	if logger == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), loggerShutdownTimeout)
+	defer cancel()
+	if err := p.shutdownLogger(ctx, logger); err != nil {
+		slog.Error("unable to shut down OTLP logger", "source", source, "error", err)
+	}
+}
+
+func (p *Pve) shutdownVMLogger(vm *VM) {
+	logger := takeLoggerForShutdown(vm)
+	p.shutdownLoggerWithTimeout(logger, fmt.Sprintf("%s/%d", vm.Type, vm.Id))
 }
 
 // execute the command to get and parse logs from a VM
@@ -282,6 +317,7 @@ func (p *Pve) pveSelfMonitoring() error {
 		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 	})
 	if err != nil {
+		p.shutdownLoggerWithTimeout(logger, fmt.Sprintf("%s/%d", vm.Type, vm.Id))
 		return fmt.Errorf("create logger for %s/%d: %w", vm.Type, vm.Id, err)
 	}
 	if logger == nil {
@@ -289,6 +325,7 @@ func (p *Pve) pveSelfMonitoring() error {
 	}
 	vm.Logger = logger
 	if !p.startManagedMonitor(&vm, true, true) {
+		p.shutdownVMLogger(&vm)
 		return fmt.Errorf("start monitor for %s/%d: service is stopping", vm.Type, vm.Id)
 	}
 	return nil
@@ -440,24 +477,40 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 		return existing
 	}
 
-	// create logger without holding the map lock
+	// Hold the lifecycle lock across logger creation and ownership transfer so
+	// Stop cannot miss an exporter that is still being constructed.
+	p.lifecycleMu.Lock()
+	if p.stopping {
+		p.lifecycleMu.Unlock()
+		return nil
+	}
 	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
 		ServiceName: vm.Name,
 		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 	})
 	if err != nil {
 		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
+		p.shutdownLoggerWithTimeout(logger, fmt.Sprintf("%s/%d", vm.Type, vm.Id))
+		p.lifecycleMu.Unlock()
+		return nil
+	}
+	if logger == nil {
+		p.lifecycleMu.Unlock()
+		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d: logger factory returned nil", vm.Type, vm.Id))
+		return nil
 	}
 	vm.Logger = logger
 
-	// insert if still not present (double-checked locking)
 	p.knownVMsMu.Lock()
-	defer p.knownVMsMu.Unlock()
 	if existing, ok := p.knownVMs[vm.Id]; ok {
-		// someone else added it while we were creating logger
+		p.knownVMsMu.Unlock()
+		p.shutdownVMLogger(vm)
+		p.lifecycleMu.Unlock()
 		return existing
 	}
 	p.knownVMs[vm.Id] = vm
+	p.knownVMsMu.Unlock()
+	p.lifecycleMu.Unlock()
 	return vm
 }
 
@@ -469,7 +522,7 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 	}
 	// ensure VM is known (and logger created) first
 	stored := p.UpdateVM(vm)
-	if stored.Logger != nil && p.startManagedMonitor(stored, false, false) {
+	if stored != nil && stored.Logger != nil && p.startManagedMonitor(stored, false, false) {
 		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", stored.Type, stored.Id))
 	}
 }
@@ -500,6 +553,7 @@ func (p *Pve) RemoveVM(id int) {
 	slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
 	if ok {
 		stopMonitor(vm, true)
+		p.shutdownVMLogger(vm)
 	}
 
 	p.knownVMsMu.Lock()
@@ -612,11 +666,12 @@ func (p *Pve) Stop() {
 	type pendingStop struct {
 		cancel context.CancelFunc
 		done   <-chan struct{}
+		vm     *VM
 	}
 	pending := make([]pendingStop, 0, len(ids)+1)
 	if selfVM != nil {
 		cancel, done := requestMonitorStop(selfVM, true)
-		pending = append(pending, pendingStop{cancel: cancel, done: done})
+		pending = append(pending, pendingStop{cancel: cancel, done: done, vm: selfVM})
 	}
 	for _, id := range ids {
 		p.knownVMsMu.RLock()
@@ -624,7 +679,7 @@ func (p *Pve) Stop() {
 		p.knownVMsMu.RUnlock()
 		if vm != nil {
 			cancel, done := requestMonitorStop(vm, true)
-			pending = append(pending, pendingStop{cancel: cancel, done: done})
+			pending = append(pending, pendingStop{cancel: cancel, done: done, vm: vm})
 		}
 	}
 
@@ -639,6 +694,19 @@ func (p *Pve) Stop() {
 			<-monitor.done
 		}
 	}
+
+	var shutdownWG sync.WaitGroup
+	for _, monitor := range pending {
+		if monitor.vm == nil {
+			continue
+		}
+		shutdownWG.Add(1)
+		go func(vm *VM) {
+			defer shutdownWG.Done()
+			p.shutdownVMLogger(vm)
+		}(monitor.vm)
+	}
+	shutdownWG.Wait()
 
 	p.knownVMsMu.Lock()
 	for _, id := range ids {

@@ -11,9 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -211,6 +209,17 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	} else {
 		return nil, fmt.Errorf("no valid OTLP endpoint provided")
 	}
+	exporterOwned := false
+	defer func() {
+		if exporterOwned {
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := exporter.Shutdown(shutdownCtx); err != nil {
+			slog.Error("unable to clean up unowned OTLP exporter", "error", err)
+		}
+	}()
 
 	providerResources, err := resource.Merge(
 		resource.Default(),
@@ -244,29 +253,13 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		sdklog.WithResource(providerResources),
 	)
 	logger := provider.Logger(cfg.OtlpLoggerName)
+	exporterOwned = true
 
-	ol := &OLogger{
+	return &OLogger{
 		Logger:   logger,
 		Ctx:      ctx,
 		Provider: provider,
-	}
-
-	// Ensure we flush pending logs on application shutdown signals.
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		sig := <-sigCh
-		slog.Info("received signal, shutting down otel logger to flush pending logs", "signal", sig)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := ol.Provider.Shutdown(shutdownCtx); err != nil {
-			slog.Error(fmt.Sprintf("error shutting down otel logger: %v", err))
-		}
-		// exit to honor the signal and ensure process termination after flushing
-		os.Exit(0)
-	}()
-
-	return ol, nil
+	}, nil
 }
 
 // Emit a Record
