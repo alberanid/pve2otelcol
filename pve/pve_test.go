@@ -1,9 +1,12 @@
 package pve
 
 import (
+	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
 	"github.com/alberanid/pve2otelcol/ologgers"
@@ -22,19 +25,26 @@ func (s *loggerFactoryStub) newLogger(_ *config.Config, opts ologgers.OLoggerOpt
 	return s.logger, s.err
 }
 
-type monitorLauncherSpy struct {
-	calls   int
+type monitorCall struct {
+	ctx     context.Context
 	vm      *VM
 	forever bool
 }
 
-func (s *monitorLauncherSpy) launch(vm *VM, forever bool) {
-	s.calls++
-	s.vm = vm
-	s.forever = forever
+type monitorRunnerStub struct {
+	calls chan monitorCall
+	runFn func(context.Context, *VM, bool) error
 }
 
-func newTestPve(t *testing.T) (*Pve, *loggerFactoryStub, *monitorLauncherSpy) {
+func (s *monitorRunnerStub) run(ctx context.Context, vm *VM, forever bool) error {
+	s.calls <- monitorCall{ctx: ctx, vm: vm, forever: forever}
+	if s.runFn != nil {
+		return s.runFn(ctx, vm, forever)
+	}
+	return nil
+}
+
+func newTestPve(t *testing.T) (*Pve, *loggerFactoryStub, *monitorRunnerStub) {
 	t.Helper()
 
 	p := New(&config.Config{
@@ -42,11 +52,22 @@ func newTestPve(t *testing.T) (*Pve, *loggerFactoryStub, *monitorLauncherSpy) {
 		RefreshInterval: 0,
 	})
 	loggerStub := &loggerFactoryStub{}
-	launcherSpy := &monitorLauncherSpy{}
+	runnerStub := &monitorRunnerStub{calls: make(chan monitorCall, 10)}
 	p.newLogger = loggerStub.newLogger
-	p.launchMonitor = launcherSpy.launch
+	p.runMonitor = runnerStub.run
 
-	return p, loggerStub, launcherSpy
+	return p, loggerStub, runnerStub
+}
+
+func waitForMonitorCall(t *testing.T, runner *monitorRunnerStub) monitorCall {
+	t.Helper()
+	select {
+	case call := <-runner.calls:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for monitor runner")
+		return monitorCall{}
+	}
 }
 
 func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
@@ -71,7 +92,7 @@ func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, loggerStub, launcherSpy := newTestPve(t)
+			p, loggerStub, runnerStub := newTestPve(t)
 			loggerStub.logger = tt.logger
 			loggerStub.err = tt.loggerErr
 
@@ -88,15 +109,15 @@ func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 			if loggerStub.calls != 1 {
 				t.Errorf("logger factory calls = %d, want 1", loggerStub.calls)
 			}
-			if launcherSpy.calls != 0 {
-				t.Errorf("monitor launcher calls = %d, want 0", launcherSpy.calls)
+			if calls := len(runnerStub.calls); calls != 0 {
+				t.Errorf("monitor runner calls = %d, want 0", calls)
 			}
 		})
 	}
 }
 
 func TestPVESelfMonitoringLaunchesAfterLoggerCreation(t *testing.T) {
-	p, loggerStub, launcherSpy := newTestPve(t)
+	p, loggerStub, runnerStub := newTestPve(t)
 	loggerStub.logger = &ologgers.OLogger{}
 
 	if err := p.pveSelfMonitoring(); err != nil {
@@ -109,19 +130,17 @@ func TestPVESelfMonitoringLaunchesAfterLoggerCreation(t *testing.T) {
 	if len(loggerStub.options) != 1 {
 		t.Fatalf("logger factory options = %d, want 1", len(loggerStub.options))
 	}
-	if launcherSpy.calls != 1 {
-		t.Fatalf("monitor launcher calls = %d, want 1", launcherSpy.calls)
-	}
-	if launcherSpy.vm == nil {
+	call := waitForMonitorCall(t, runnerStub)
+	if call.vm == nil {
 		t.Fatal("monitor launcher VM = nil, want PVE monitor")
 	}
-	if launcherSpy.vm.Logger != loggerStub.logger {
+	if call.vm.Logger != loggerStub.logger {
 		t.Error("monitor launcher received VM without the created logger")
 	}
-	if launcherSpy.vm.Type != "pve" || launcherSpy.vm.Id != 0 {
-		t.Errorf("monitor launcher VM = %s/%d, want pve/0", launcherSpy.vm.Type, launcherSpy.vm.Id)
+	if call.vm.Type != "pve" || call.vm.Id != 0 {
+		t.Errorf("monitor launcher VM = %s/%d, want pve/0", call.vm.Type, call.vm.Id)
 	}
-	if !launcherSpy.forever {
+	if !call.forever {
 		t.Error("monitor launcher forever = false, want true")
 	}
 
@@ -129,13 +148,13 @@ func TestPVESelfMonitoringLaunchesAfterLoggerCreation(t *testing.T) {
 	if opts.ServiceId != "pve/0" {
 		t.Errorf("logger service ID = %q, want %q", opts.ServiceId, "pve/0")
 	}
-	if opts.ServiceName != launcherSpy.vm.Name {
-		t.Errorf("logger service name = %q, want VM name %q", opts.ServiceName, launcherSpy.vm.Name)
+	if opts.ServiceName != call.vm.Name {
+		t.Errorf("logger service name = %q, want VM name %q", opts.ServiceName, call.vm.Name)
 	}
 }
 
 func TestStartReturnsPVESelfMonitoringError(t *testing.T) {
-	p, loggerStub, launcherSpy := newTestPve(t)
+	p, loggerStub, runnerStub := newTestPve(t)
 	loggerError := errors.New("exporter initialization failed")
 	loggerStub.err = loggerError
 
@@ -143,7 +162,223 @@ func TestStartReturnsPVESelfMonitoringError(t *testing.T) {
 	if !errors.Is(err, loggerError) {
 		t.Fatalf("Start() error = %v, want wrapped %v", err, loggerError)
 	}
-	if launcherSpy.calls != 0 {
-		t.Errorf("monitor launcher calls = %d, want 0", launcherSpy.calls)
+	if calls := len(runnerStub.calls); calls != 0 {
+		t.Errorf("monitor runner calls = %d, want 0", calls)
+	}
+}
+
+func TestStartIsIdempotentWithoutRefreshTicker(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+
+	if err := p.Start(); err != nil {
+		t.Fatalf("first Start() error = %v, want nil", err)
+	}
+	waitForMonitorCall(t, runnerStub)
+	if err := p.Start(); err != nil {
+		t.Fatalf("second Start() error = %v, want nil", err)
+	}
+	if calls := len(runnerStub.calls); calls != 0 {
+		t.Errorf("additional monitor runner calls = %d, want 0", calls)
+	}
+}
+
+func TestStopVMMonitoringCancelsAndWaitsForMonitor(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	receivedCancellation := make(chan struct{})
+	releaseRunner := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		close(receivedCancellation)
+		<-releaseRunner
+		return ctx.Err()
+	}
+
+	p.StartVMMonitoring(&VM{Id: 101, Name: "test", Type: "lxc", MonitorCmd: "journalctl"})
+	call := waitForMonitorCall(t, runnerStub)
+	stopReturned := make(chan struct{})
+	go func() {
+		p.StopVMMonitoring(101)
+		close(stopReturned)
+	}()
+
+	select {
+	case <-receivedCancellation:
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not receive cancellation")
+	}
+	select {
+	case <-stopReturned:
+		t.Fatal("StopVMMonitoring returned before the monitor exited")
+	default:
+	}
+
+	call.vm.stateMu.Lock()
+	running := call.vm.running
+	stopping := call.vm.stopping
+	call.vm.stateMu.Unlock()
+	if running || !stopping {
+		t.Errorf("monitor state while stopping = running:%t stopping:%t, want false/true", running, stopping)
+	}
+
+	close(releaseRunner)
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("StopVMMonitoring did not wait for monitor exit")
+	}
+
+	call.vm.stateMu.Lock()
+	running = call.vm.running
+	stopping = call.vm.stopping
+	cancel := call.vm.cancel
+	call.vm.stateMu.Unlock()
+	if running || stopping || cancel != nil {
+		t.Errorf("final monitor state = running:%t stopping:%t cancel:%v, want stopped", running, stopping, cancel)
+	}
+}
+
+func TestStopVMMonitoringInterruptsRetryDelay(t *testing.T) {
+	p, loggerStub, _ := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	p.cfg.CmdRetryTimes = 3
+	p.cfg.CmdRetryDelay = 60
+	p.runMonitor = p.RunKeptAliveProcess
+	firstAttempt := make(chan struct{})
+	var attempts atomic.Int32
+	p.runProcess = func(context.Context, *VM) error {
+		if attempts.Add(1) == 1 {
+			close(firstAttempt)
+		}
+		return errors.New("process failed")
+	}
+
+	p.StartVMMonitoring(&VM{Id: 102, Name: "retry", Type: "lxc", MonitorCmd: "journalctl"})
+	select {
+	case <-firstAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not make its first attempt")
+	}
+
+	stopReturned := make(chan struct{})
+	go func() {
+		p.StopVMMonitoring(102)
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("StopVMMonitoring did not interrupt retry delay")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("process attempts = %d, want 1", got)
+	}
+}
+
+func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	receivedCancellation := make(chan struct{})
+	releaseRunner := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		close(receivedCancellation)
+		<-releaseRunner
+		return ctx.Err()
+	}
+
+	p.StartVMMonitoring(&VM{Id: 104, Name: "remove", Type: "lxc", MonitorCmd: "journalctl"})
+	waitForMonitorCall(t, runnerStub)
+	removeReturned := make(chan struct{})
+	go func() {
+		p.RemoveVM(104)
+		close(removeReturned)
+	}()
+
+	select {
+	case <-receivedCancellation:
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not receive cancellation")
+	}
+	p.knownVMsMu.RLock()
+	_, stillKnown := p.knownVMs[104]
+	p.knownVMsMu.RUnlock()
+	if !stillKnown {
+		t.Fatal("VM state was deleted before the monitor exited")
+	}
+	select {
+	case <-removeReturned:
+		t.Fatal("RemoveVM returned before the monitor exited")
+	default:
+	}
+
+	close(releaseRunner)
+	select {
+	case <-removeReturned:
+	case <-time.After(time.Second):
+		t.Fatal("RemoveVM did not return after the monitor exited")
+	}
+	p.knownVMsMu.RLock()
+	_, stillKnown = p.knownVMs[104]
+	p.knownVMsMu.RUnlock()
+	if stillKnown {
+		t.Fatal("VM state remains after monitor removal")
+	}
+}
+
+func TestStopCancelsAndWaitsForAllMonitors(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	cancellations := make(chan int, 2)
+	releaseRunners := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, vm *VM, _ bool) error {
+		<-ctx.Done()
+		cancellations <- vm.Id
+		<-releaseRunners
+		return ctx.Err()
+	}
+
+	if err := p.pveSelfMonitoring(); err != nil {
+		t.Fatalf("pveSelfMonitoring() error = %v, want nil", err)
+	}
+	p.StartVMMonitoring(&VM{Id: 103, Name: "guest", Type: "lxc", MonitorCmd: "journalctl"})
+	waitForMonitorCall(t, runnerStub)
+	waitForMonitorCall(t, runnerStub)
+
+	stopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopReturned)
+	}()
+	for range 2 {
+		select {
+		case <-cancellations:
+		case <-time.After(time.Second):
+			t.Fatal("not all monitors received cancellation")
+		}
+	}
+	select {
+	case <-stopReturned:
+		t.Fatal("Stop returned before all monitors exited")
+	default:
+	}
+
+	close(releaseRunners)
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return after all monitors exited")
+	}
+
+	secondStopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(secondStopReturned)
+	}()
+	select {
+	case <-secondStopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("second Stop call did not return")
 	}
 }
