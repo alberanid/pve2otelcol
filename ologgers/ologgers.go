@@ -103,12 +103,9 @@ func transformBody(i interface{}) otellog.Value {
 func str2time(s string) (time.Time, error) {
 	i, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return time.Now(), nil
+		return time.Time{}, fmt.Errorf("parse journal timestamp %q: %w", s, err)
 	}
-	secs := int64(i / 1000000)
-	micros := int64(i%1000000) * 1000
-	tm := time.Unix(secs, micros)
-	return tm, nil
+	return time.UnixMicro(i), nil
 }
 
 // Object used to log to an OpenTelemetry instance
