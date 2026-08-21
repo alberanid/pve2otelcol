@@ -13,12 +13,14 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/embedded"
 )
@@ -48,37 +50,37 @@ func TestTransformBodyPreservesScalarValues(t *testing.T) {
 	tests := []struct {
 		name  string
 		input interface{}
-		want  otellog.Value
+		want  attribute.Value
 	}{
-		{"string", "message", otellog.StringValue("message")},
-		{"bytes", []byte{0, 1, 2}, otellog.BytesValue([]byte{0, 1, 2})},
-		{"bool", true, otellog.BoolValue(true)},
-		{"int", int(-1), otellog.Int64Value(-1)},
-		{"int8", int8(-8), otellog.Int64Value(-8)},
-		{"int16", int16(-16), otellog.Int64Value(-16)},
-		{"int32", int32(-32), otellog.Int64Value(-32)},
-		{"int64", int64(math.MinInt64), otellog.Int64Value(math.MinInt64)},
-		{"named signed integer", namedInt16(-17), otellog.Int64Value(-17)},
-		{"uint", uint(1), otellog.Int64Value(1)},
-		{"uint8", uint8(8), otellog.Int64Value(8)},
-		{"uint16", uint16(16), otellog.Int64Value(16)},
-		{"uint32", uint32(32), otellog.Int64Value(32)},
-		{"uint64 within signed range", uint64(math.MaxInt64), otellog.Int64Value(math.MaxInt64)},
-		{"uintptr", uintptr(64), otellog.Int64Value(64)},
-		{"named unsigned integer", namedUint64(65), otellog.Int64Value(65)},
-		{"uint64 above signed range", uint64(math.MaxInt64) + 1, otellog.StringValue("9223372036854775808")},
-		{"maximum uint64", uint64(math.MaxUint64), otellog.StringValue("18446744073709551615")},
-		{"float32", float32(1.25), otellog.Float64Value(1.25)},
-		{"float64", float64(-2.5), otellog.Float64Value(-2.5)},
-		{"named float", namedFloat32(3.5), otellog.Float64Value(3.5)},
-		{"null", nil, otellog.StringValue("null")},
-		{"unsupported value", unsupported{Name: "example", Count: 7}, otellog.StringValue("{Name:example Count:7}")},
+		{"string", "message", attribute.StringValue("message")},
+		{"bytes", []byte{0, 1, 2}, attribute.ByteSliceValue([]byte{0, 1, 2})},
+		{"bool", true, attribute.BoolValue(true)},
+		{"int", int(-1), attribute.Int64Value(-1)},
+		{"int8", int8(-8), attribute.Int64Value(-8)},
+		{"int16", int16(-16), attribute.Int64Value(-16)},
+		{"int32", int32(-32), attribute.Int64Value(-32)},
+		{"int64", int64(math.MinInt64), attribute.Int64Value(math.MinInt64)},
+		{"named signed integer", namedInt16(-17), attribute.Int64Value(-17)},
+		{"uint", uint(1), attribute.Int64Value(1)},
+		{"uint8", uint8(8), attribute.Int64Value(8)},
+		{"uint16", uint16(16), attribute.Int64Value(16)},
+		{"uint32", uint32(32), attribute.Int64Value(32)},
+		{"uint64 within signed range", uint64(math.MaxInt64), attribute.Int64Value(math.MaxInt64)},
+		{"uintptr", uintptr(64), attribute.Int64Value(64)},
+		{"named unsigned integer", namedUint64(65), attribute.Int64Value(65)},
+		{"uint64 above signed range", uint64(math.MaxInt64) + 1, attribute.StringValue("9223372036854775808")},
+		{"maximum uint64", uint64(math.MaxUint64), attribute.StringValue("18446744073709551615")},
+		{"float32", float32(1.25), attribute.Float64Value(1.25)},
+		{"float64", float64(-2.5), attribute.Float64Value(-2.5)},
+		{"named float", namedFloat32(3.5), attribute.Float64Value(3.5)},
+		{"null", nil, attribute.StringValue("null")},
+		{"unsupported value", unsupported{Name: "example", Count: 7}, attribute.StringValue("{Name:example Count:7}")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := transformBody(tt.input)
-			if !got.Equal(tt.want) {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("transformBody(%T(%v)) = %v, want %v", tt.input, tt.input, got, tt.want)
 			}
 		})
@@ -92,21 +94,21 @@ func TestTransformBodyPreservesNestedNullAndUnsupportedValues(t *testing.T) {
 		"unsupported": unsupported{Value: "kept"},
 		"slice":       []interface{}{nil, uint64(math.MaxUint64)},
 	})
-	if body.Kind() != otellog.KindMap {
-		t.Fatalf("body kind = %v, want map", body.Kind())
+	if body.Type() != attribute.MAP {
+		t.Fatalf("body type = %v, want map", body.Type())
 	}
 
 	null := mapValue(t, body, "null")
-	if null.Kind() != otellog.KindString || null.AsString() != "null" {
+	if null.Type() != attribute.STRING || null.AsString() != "null" {
 		t.Fatalf("null value = %v, want string null", null)
 	}
 	unsupportedValue := mapValue(t, body, "unsupported")
-	if unsupportedValue.Kind() != otellog.KindString || unsupportedValue.AsString() != "{Value:kept}" {
+	if unsupportedValue.Type() != attribute.STRING || unsupportedValue.AsString() != "{Value:kept}" {
 		t.Fatalf("unsupported value = %v, want preserved text", unsupportedValue)
 	}
 	slice := mapValue(t, body, "slice")
-	if slice.Kind() != otellog.KindSlice {
-		t.Fatalf("slice kind = %v, want slice", slice.Kind())
+	if slice.Type() != attribute.SLICE {
+		t.Fatalf("slice type = %v, want slice", slice.Type())
 	}
 	values := slice.AsSlice()
 	if len(values) != 2 || values[0].AsString() != "null" || values[1].AsString() != "18446744073709551615" {
@@ -139,7 +141,7 @@ func TestLogAvoidsInvalidKindErrors(t *testing.T) {
 	if len(recorder.records) != 2 {
 		t.Fatalf("emitted records = %d, want 2", len(recorder.records))
 	}
-	if body := recorder.records[0].Body(); body.Kind() != otellog.KindString || body.AsString() != "malformed journal record" {
+	if body := recorder.records[0].Body(); body.Type() != attribute.STRING || body.AsString() != "malformed journal record" {
 		t.Fatalf("malformed record body = %v, want original string", body)
 	}
 	metadataRecord := recorder.records[1]
@@ -178,31 +180,31 @@ func TestLogExtractsStringMetadata(t *testing.T) {
 	if record.Severity() != otellog.SeverityWarn || record.SeverityText() != "WARN" {
 		t.Errorf("severity = %v/%q, want WARN", record.Severity(), record.SeverityText())
 	}
-	attributes := map[string]otellog.Value{}
-	record.WalkAttributes(func(kv otellog.KeyValue) bool {
-		attributes[kv.Key] = kv.Value
+	attributes := map[string]attribute.Value{}
+	record.WalkAttributes(func(kv attribute.KeyValue) bool {
+		attributes[string(kv.Key)] = kv.Value
 		return true
 	})
-	if pid := attributes["pid"]; pid.Kind() != otellog.KindInt64 || pid.AsInt64() != math.MaxInt64 {
+	if pid := attributes["pid"]; pid.Type() != attribute.INT64 || pid.AsInt64() != math.MaxInt64 {
 		t.Errorf("pid attribute = %v, want maximum int64", pid)
 	}
-	if command := attributes["command"]; command.Kind() != otellog.KindString || command.AsString() != "systemd" {
+	if command := attributes["command"]; command.Type() != attribute.STRING || command.AsString() != "systemd" {
 		t.Errorf("command attribute = %v, want systemd", command)
 	}
 }
 
-func mapValue(t *testing.T, value otellog.Value, key string) otellog.Value {
+func mapValue(t *testing.T, value attribute.Value, key string) attribute.Value {
 	t.Helper()
-	if value.Kind() != otellog.KindMap {
-		t.Fatalf("value kind = %v, want map", value.Kind())
+	if value.Type() != attribute.MAP {
+		t.Fatalf("value type = %v, want map", value.Type())
 	}
 	for _, kv := range value.AsMap() {
-		if kv.Key == key {
+		if string(kv.Key) == key {
 			return kv.Value
 		}
 	}
 	t.Fatalf("map does not contain key %q", key)
-	return otellog.Value{}
+	return attribute.Value{}
 }
 
 func TestStr2time(t *testing.T) {
