@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
+	"go.opentelemetry.io/otel"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/embedded"
 )
@@ -33,6 +34,175 @@ func (l *recordingLogger) Emit(_ context.Context, record otellog.Record) {
 
 func (l *recordingLogger) Enabled(context.Context, otellog.EnabledParameters) bool {
 	return true
+}
+
+func TestTransformBodyPreservesScalarValues(t *testing.T) {
+	type namedInt16 int16
+	type namedUint64 uint64
+	type namedFloat32 float32
+	type unsupported struct {
+		Name  string
+		Count int
+	}
+
+	tests := []struct {
+		name  string
+		input interface{}
+		want  otellog.Value
+	}{
+		{"string", "message", otellog.StringValue("message")},
+		{"bytes", []byte{0, 1, 2}, otellog.BytesValue([]byte{0, 1, 2})},
+		{"bool", true, otellog.BoolValue(true)},
+		{"int", int(-1), otellog.Int64Value(-1)},
+		{"int8", int8(-8), otellog.Int64Value(-8)},
+		{"int16", int16(-16), otellog.Int64Value(-16)},
+		{"int32", int32(-32), otellog.Int64Value(-32)},
+		{"int64", int64(math.MinInt64), otellog.Int64Value(math.MinInt64)},
+		{"named signed integer", namedInt16(-17), otellog.Int64Value(-17)},
+		{"uint", uint(1), otellog.Int64Value(1)},
+		{"uint8", uint8(8), otellog.Int64Value(8)},
+		{"uint16", uint16(16), otellog.Int64Value(16)},
+		{"uint32", uint32(32), otellog.Int64Value(32)},
+		{"uint64 within signed range", uint64(math.MaxInt64), otellog.Int64Value(math.MaxInt64)},
+		{"uintptr", uintptr(64), otellog.Int64Value(64)},
+		{"named unsigned integer", namedUint64(65), otellog.Int64Value(65)},
+		{"uint64 above signed range", uint64(math.MaxInt64) + 1, otellog.StringValue("9223372036854775808")},
+		{"maximum uint64", uint64(math.MaxUint64), otellog.StringValue("18446744073709551615")},
+		{"float32", float32(1.25), otellog.Float64Value(1.25)},
+		{"float64", float64(-2.5), otellog.Float64Value(-2.5)},
+		{"named float", namedFloat32(3.5), otellog.Float64Value(3.5)},
+		{"null", nil, otellog.StringValue("null")},
+		{"unsupported value", unsupported{Name: "example", Count: 7}, otellog.StringValue("{Name:example Count:7}")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := transformBody(tt.input)
+			if !got.Equal(tt.want) {
+				t.Fatalf("transformBody(%T(%v)) = %v, want %v", tt.input, tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransformBodyPreservesNestedNullAndUnsupportedValues(t *testing.T) {
+	type unsupported struct{ Value string }
+	body := transformBody(map[string]interface{}{
+		"null":        nil,
+		"unsupported": unsupported{Value: "kept"},
+		"slice":       []interface{}{nil, uint64(math.MaxUint64)},
+	})
+	if body.Kind() != otellog.KindMap {
+		t.Fatalf("body kind = %v, want map", body.Kind())
+	}
+
+	null := mapValue(t, body, "null")
+	if null.Kind() != otellog.KindString || null.AsString() != "null" {
+		t.Fatalf("null value = %v, want string null", null)
+	}
+	unsupportedValue := mapValue(t, body, "unsupported")
+	if unsupportedValue.Kind() != otellog.KindString || unsupportedValue.AsString() != "{Value:kept}" {
+		t.Fatalf("unsupported value = %v, want preserved text", unsupportedValue)
+	}
+	slice := mapValue(t, body, "slice")
+	if slice.Kind() != otellog.KindSlice {
+		t.Fatalf("slice kind = %v, want slice", slice.Kind())
+	}
+	values := slice.AsSlice()
+	if len(values) != 2 || values[0].AsString() != "null" || values[1].AsString() != "18446744073709551615" {
+		t.Fatalf("nested slice = %v, want preserved null and uint64", values)
+	}
+}
+
+func TestLogAvoidsInvalidKindErrors(t *testing.T) {
+	var otelErrors []error
+	originalHandler := otel.GetErrorHandler()
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		otelErrors = append(otelErrors, err)
+	}))
+	t.Cleanup(func() { otel.SetErrorHandler(originalHandler) })
+
+	recorder := &recordingLogger{}
+	logger := &OLogger{Logger: recorder, Ctx: context.Background()}
+	logger.Log("malformed journal record")
+	logger.Log(map[string]interface{}{
+		"_SOURCE_REALTIME_TIMESTAMP": int64(1700000000123456),
+		"__REALTIME_TIMESTAMP":       false,
+		"PRIORITY":                   []interface{}{"3"},
+		"_PID":                       float64(123),
+		"_COMM":                      map[string]interface{}{"name": "systemd"},
+	})
+
+	if len(otelErrors) != 0 {
+		t.Fatalf("OpenTelemetry errors = %v, want none", otelErrors)
+	}
+	if len(recorder.records) != 2 {
+		t.Fatalf("emitted records = %d, want 2", len(recorder.records))
+	}
+	if body := recorder.records[0].Body(); body.Kind() != otellog.KindString || body.AsString() != "malformed journal record" {
+		t.Fatalf("malformed record body = %v, want original string", body)
+	}
+	metadataRecord := recorder.records[1]
+	if !metadataRecord.Timestamp().IsZero() || !metadataRecord.ObservedTimestamp().IsZero() {
+		t.Error("non-string timestamp metadata should remain unset")
+	}
+	if metadataRecord.Severity() != otellog.SeverityUndefined || metadataRecord.SeverityText() != "" {
+		t.Error("non-string priority metadata should remain unset")
+	}
+	if metadataRecord.AttributesLen() != 0 {
+		t.Fatalf("attributes = %d, want none for non-string metadata", metadataRecord.AttributesLen())
+	}
+}
+
+func TestLogExtractsStringMetadata(t *testing.T) {
+	recorder := &recordingLogger{}
+	logger := &OLogger{Logger: recorder, Ctx: context.Background()}
+	logger.Log(map[string]interface{}{
+		"_SOURCE_REALTIME_TIMESTAMP": "1700000000123456",
+		"__REALTIME_TIMESTAMP":       "1700000000654321",
+		"PRIORITY":                   "4",
+		"_PID":                       "9223372036854775807",
+		"_COMM":                      "systemd",
+	})
+
+	if len(recorder.records) != 1 {
+		t.Fatalf("emitted records = %d, want 1", len(recorder.records))
+	}
+	record := recorder.records[0]
+	if got := record.Timestamp(); !got.Equal(time.Unix(1700000000, 123456000)) {
+		t.Errorf("timestamp = %v, want parsed source timestamp", got)
+	}
+	if got := record.ObservedTimestamp(); !got.Equal(time.Unix(1700000000, 654321000)) {
+		t.Errorf("observed timestamp = %v, want parsed observed timestamp", got)
+	}
+	if record.Severity() != otellog.SeverityWarn || record.SeverityText() != "WARN" {
+		t.Errorf("severity = %v/%q, want WARN", record.Severity(), record.SeverityText())
+	}
+	attributes := map[string]otellog.Value{}
+	record.WalkAttributes(func(kv otellog.KeyValue) bool {
+		attributes[kv.Key] = kv.Value
+		return true
+	})
+	if pid := attributes["pid"]; pid.Kind() != otellog.KindInt64 || pid.AsInt64() != math.MaxInt64 {
+		t.Errorf("pid attribute = %v, want maximum int64", pid)
+	}
+	if command := attributes["command"]; command.Kind() != otellog.KindString || command.AsString() != "systemd" {
+		t.Errorf("command attribute = %v, want systemd", command)
+	}
+}
+
+func mapValue(t *testing.T, value otellog.Value, key string) otellog.Value {
+	t.Helper()
+	if value.Kind() != otellog.KindMap {
+		t.Fatalf("value kind = %v, want map", value.Kind())
+	}
+	for _, kv := range value.AsMap() {
+		if kv.Key == key {
+			return kv.Value
+		}
+	}
+	t.Fatalf("map does not contain key %q", key)
+	return otellog.Value{}
 }
 
 func TestStr2time(t *testing.T) {

@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -54,16 +56,11 @@ var prio2string = map[string]string{
 
 // Transform an interface to an object suitable to be logged by OpenTelemetry
 func transformBody(i interface{}) otellog.Value {
-	// the OpenTelemetry SDK replaces JSON null or unknown values to the "INVALID" string, which is an odd choice;
-	// here we stay consistent with this behavior returning a string, but at least it's empty.
-	_emptyValue := otellog.StringValue("")
 	switch obj := i.(type) {
 	case string:
 		return otellog.StringValue(obj)
 	case []byte:
 		return otellog.BytesValue(obj)
-	case int:
-		return otellog.IntValue(obj)
 	case float32:
 		return otellog.Float64Value(float64(obj))
 	case float64:
@@ -73,30 +70,42 @@ func transformBody(i interface{}) otellog.Value {
 	case map[string]interface{}:
 		ret := []otellog.KeyValue{}
 		for key, value := range obj {
-			oval := transformBody(value)
-			if oval.Empty() {
-				oval = _emptyValue
-			}
 			ret = append(ret, otellog.KeyValue{
 				Key:   key,
-				Value: oval,
+				Value: transformBody(value),
 			})
 		}
 		return otellog.MapValue(ret...)
 	case []interface{}:
 		ret := []otellog.Value{}
 		for _, i := range obj {
-			oval := transformBody(i)
-			if oval.Empty() {
-				oval = _emptyValue
-			}
-			ret = append(ret, oval)
+			ret = append(ret, transformBody(i))
 		}
 		return otellog.SliceValue(ret...)
 	case nil:
-		return _emptyValue
+		// OTLP AnyValue has no null kind. Keep JSON null distinct from an empty
+		// string and from the exporter's "INVALID" encoding for KindEmpty.
+		return otellog.StringValue("null")
 	default:
-		return _emptyValue
+		value := reflect.ValueOf(obj)
+		switch value.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return otellog.Int64Value(value.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			unsigned := value.Uint()
+			if unsigned <= math.MaxInt64 {
+				return otellog.Int64Value(int64(unsigned))
+			}
+			// OTLP has only signed int64 values. Preserve larger unsigned values
+			// exactly as decimal text instead of wrapping them.
+			return otellog.StringValue(strconv.FormatUint(unsigned, 10))
+		case reflect.Float32, reflect.Float64:
+			return otellog.Float64Value(value.Float())
+		default:
+			// Unsupported values cannot be represented structurally by OTLP, but
+			// their text is still more useful than silently replacing them with "".
+			return otellog.StringValue(fmt.Sprintf("%+v", obj))
+		}
 	}
 }
 
@@ -299,37 +308,45 @@ func (o *OLogger) Log(i interface{}) {
 	body := transformBody(i)
 	record := otellog.Record{}
 	record.SetBody(body)
+	if body.Kind() != otellog.KindMap {
+		o.LogRecord(record)
+		return
+	}
 	for _, kv := range body.AsMap() {
+		if kv.Value.Kind() != otellog.KindString {
+			continue
+		}
+		value := kv.Value.AsString()
 		switch kv.Key {
 		case "_SOURCE_REALTIME_TIMESTAMP":
-			tm, err := str2time(kv.Value.AsString())
+			tm, err := str2time(value)
 			if err == nil {
 				record.SetTimestamp(tm)
 			}
 		case "__REALTIME_TIMESTAMP":
-			tm, err := str2time(kv.Value.AsString())
+			tm, err := str2time(value)
 			if err == nil {
 				record.SetObservedTimestamp(tm)
 			}
 		case "PRIORITY":
-			if severity, ok := prio2severity[kv.Value.AsString()]; ok {
+			if severity, ok := prio2severity[value]; ok {
 				record.SetSeverity(severity)
 			}
-			if severityTxt, ok := prio2string[kv.Value.AsString()]; ok {
+			if severityTxt, ok := prio2string[value]; ok {
 				record.SetSeverityText(severityTxt)
 			}
 		case "_PID":
-			pid, err := strconv.Atoi(kv.Value.AsString())
+			pid, err := strconv.ParseInt(value, 10, 64)
 			if err == nil {
 				record.AddAttributes(otellog.KeyValue{
 					Key:   "pid",
-					Value: otellog.IntValue(pid),
+					Value: otellog.Int64Value(pid),
 				})
 			}
 		case "_COMM":
 			record.AddAttributes(otellog.KeyValue{
 				Key:   "command",
-				Value: otellog.StringValue(kv.Value.AsString()),
+				Value: otellog.StringValue(value),
 			})
 		}
 	}

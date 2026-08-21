@@ -68,6 +68,8 @@ The certificate and key options must be supplied together, and all TLS file opti
 
 Journal cursors are checkpointed per source under `/var/lib/pve2otelcol/cursors` by default. When a monitoring command restarts, the saved cursor is passed to `journalctl --after-cursor`, so records written during the restart are replayed instead of skipped. Checkpoints advance only after a record has been handed to the OpenTelemetry logger; after an abrupt process or host failure, a short suffix may therefore be delivered more than once. Use `--cursor-dir` to select another state directory, or pass an empty value to disable persistence.
 
+Structured journal values retain their native OpenTelemetry type where one exists. Unsigned integers too large for OTLP's signed 64-bit integer type are preserved as exact decimal strings, JSON null is represented as the string `"null"`, and otherwise unsupported values retain their formatted text. Metadata such as timestamps, priority, PID, and command is derived only from correctly typed string fields; malformed fields remain in the body without producing OpenTelemetry type errors.
+
 ### Systemd unit
 
 To better integrate it with your PVE node, you can use the provided systemd unit file.
