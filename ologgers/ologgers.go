@@ -26,7 +26,7 @@ import (
 	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 // map syslog severity levels (priority, in systemd) to OTLP severity.
@@ -132,6 +132,22 @@ type OLoggerOptions struct {
 	ServiceName string
 }
 
+// newProviderResource combines the process resource detected by the SDK with
+// the source-specific service identity. The service attributes are deliberately
+// schemaless: resource.Default owns the schema URL, avoiding a merge conflict
+// when the SDK updates its semantic-convention version.
+func newProviderResource(opts OLoggerOptions) (*resource.Resource, error) {
+	serviceResource := resource.NewSchemaless(
+		semconv.ServiceInstanceID(opts.ServiceId),
+		semconv.ServiceName(opts.ServiceName),
+	)
+	providerResource, err := resource.Merge(resource.Default(), serviceResource)
+	if err != nil {
+		return nil, fmt.Errorf("merge default and service resources: %w", err)
+	}
+	return providerResource, nil
+}
+
 // Create an OLogger instance
 func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 	ctx := context.Background()
@@ -210,26 +226,10 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		}
 	}()
 
-	providerResources, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceInstanceID(opts.ServiceId),
-		),
-	)
+	providerResources, err := newProviderResource(opts)
 	if err != nil {
-		slog.Error("unable to set logger service instance ID", "service_id", opts.ServiceId, "error", err)
-		return nil, err
-	}
-	providerResources, err = resource.Merge(
-		providerResources,
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(opts.ServiceName),
-		),
-	)
-	if err != nil {
-		slog.Error("unable to set logger service name", "service_name", opts.ServiceName, "error", err)
+		slog.Error("unable to set logger service resource", "service_id", opts.ServiceId,
+			"service_name", opts.ServiceName, "error", err)
 		return nil, err
 	}
 

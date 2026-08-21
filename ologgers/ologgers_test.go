@@ -23,6 +23,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/embedded"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 type recordingLogger struct {
@@ -36,6 +38,25 @@ func (l *recordingLogger) Emit(_ context.Context, record otellog.Record) {
 
 func (l *recordingLogger) Enabled(context.Context, otellog.EnabledParameters) bool {
 	return true
+}
+
+func TestNewProviderResourceMergesWithDefaultSchema(t *testing.T) {
+	opts := OLoggerOptions{ServiceId: "pve/0", ServiceName: "paprika"}
+	providerResource, err := newProviderResource(opts)
+	if err != nil {
+		t.Fatalf("newProviderResource() error = %v, want nil", err)
+	}
+	if got, want := providerResource.SchemaURL(), resource.Default().SchemaURL(); got != want {
+		t.Fatalf("resource schema URL = %q, want default schema %q", got, want)
+	}
+	serviceID, ok := providerResource.Set().Value(semconv.ServiceInstanceIDKey)
+	if !ok || serviceID.AsString() != opts.ServiceId {
+		t.Fatalf("service.instance.id = %v, %t; want %q", serviceID, ok, opts.ServiceId)
+	}
+	serviceName, ok := providerResource.Set().Value(semconv.ServiceNameKey)
+	if !ok || serviceName.AsString() != opts.ServiceName {
+		t.Fatalf("service.name = %v, %t; want %q", serviceName, ok, opts.ServiceName)
+	}
 }
 
 func TestTransformBodyPreservesScalarValues(t *testing.T) {
