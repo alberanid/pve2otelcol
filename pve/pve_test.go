@@ -70,6 +70,29 @@ func waitForMonitorCall(t *testing.T, runner *monitorRunnerStub) monitorCall {
 	}
 }
 
+func waitForMonitorStopped(t *testing.T, vm *VM) error {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		vm.stateMu.Lock()
+		stopped := !vm.running && !vm.stopping
+		err := vm.lastError
+		vm.stateMu.Unlock()
+		if stopped {
+			return err
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("timed out waiting for monitor to stop")
+			return nil
+		}
+	}
+}
+
 func TestPVESelfMonitoringDoesNotLaunchWithoutLogger(t *testing.T) {
 	loggerError := errors.New("exporter initialization failed")
 	tests := []struct {
@@ -273,6 +296,98 @@ func TestStopVMMonitoringInterruptsRetryDelay(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("process attempts = %d, want 1", got)
+	}
+}
+
+func TestRetryExhaustionPublishesErrorAndAllowsRestart(t *testing.T) {
+	p, loggerStub, _ := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	p.cfg.CmdRetryTimes = 2
+	p.cfg.CmdRetryDelay = 0
+	p.runMonitor = p.RunKeptAliveProcess
+	processError := errors.New("process failed")
+	var attempts atomic.Int32
+	p.runProcess = func(context.Context, *VM) error {
+		attempts.Add(1)
+		return processError
+	}
+	vm := &VM{Id: 105, Name: "retry", Type: "lxc", MonitorCmd: "journalctl"}
+
+	p.StartVMMonitoring(vm)
+	p.knownVMsMu.RLock()
+	stored := p.knownVMs[vm.Id]
+	p.knownVMsMu.RUnlock()
+	terminalErr := waitForMonitorStopped(t, stored)
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("process attempts = %d, want 3 (initial attempt plus two retries)", got)
+	}
+	if !errors.Is(terminalErr, processError) {
+		t.Fatalf("terminal error = %v, want wrapped %v", terminalErr, processError)
+	}
+	if !strings.Contains(terminalErr.Error(), "after 3 attempt(s)") {
+		t.Errorf("terminal error = %q, want attempt count", terminalErr)
+	}
+
+	p.StartVMMonitoring(vm)
+	terminalErr = waitForMonitorStopped(t, stored)
+	if got := attempts.Load(); got != 6 {
+		t.Fatalf("process attempts after restart = %d, want 6", got)
+	}
+	if !errors.Is(terminalErr, processError) {
+		t.Fatalf("restart terminal error = %v, want wrapped %v", terminalErr, processError)
+	}
+}
+
+func TestNormalProcessExitIsRetryableFailure(t *testing.T) {
+	p, loggerStub, _ := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	p.cfg.CmdRetryTimes = 0
+	p.runMonitor = p.RunKeptAliveProcess
+	var attempts atomic.Int32
+	p.runProcess = func(context.Context, *VM) error {
+		attempts.Add(1)
+		return nil
+	}
+	vm := &VM{Id: 106, Name: "exit", Type: "lxc", MonitorCmd: "journalctl"}
+
+	p.StartVMMonitoring(vm)
+	p.knownVMsMu.RLock()
+	stored := p.knownVMs[vm.Id]
+	p.knownVMsMu.RUnlock()
+	terminalErr := waitForMonitorStopped(t, stored)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("process attempts = %d, want one initial attempt", got)
+	}
+	if !errors.Is(terminalErr, errMonitorExited) {
+		t.Fatalf("terminal error = %v, want %v", terminalErr, errMonitorExited)
+	}
+}
+
+func TestDryRunDoesNotCreateLoggersOrMonitorState(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	p.cfg.DryRun = true
+
+	if err := p.pveSelfMonitoring(); err != nil {
+		t.Fatalf("pveSelfMonitoring() error = %v, want nil", err)
+	}
+	p.StartVMMonitoring(&VM{Id: 107, Name: "dry-run", Type: "lxc", MonitorCmd: "journalctl"})
+	if loggerStub.calls != 0 {
+		t.Errorf("logger factory calls = %d, want 0", loggerStub.calls)
+	}
+	if calls := len(runnerStub.calls); calls != 0 {
+		t.Errorf("monitor runner calls = %d, want 0", calls)
+	}
+	p.knownVMsMu.RLock()
+	knownVMs := len(p.knownVMs)
+	p.knownVMsMu.RUnlock()
+	if knownVMs != 0 {
+		t.Errorf("known VMs = %d, want 0", knownVMs)
+	}
+	p.lifecycleMu.Lock()
+	selfVM := p.selfVM
+	p.lifecycleMu.Unlock()
+	if selfVM != nil {
+		t.Error("self monitor state was created during dry-run")
 	}
 }
 

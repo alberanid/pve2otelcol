@@ -47,6 +47,8 @@ type monitorRunner func(context.Context, *VM, bool) error
 
 type processRunner func(context.Context, *VM) error
 
+var errMonitorExited = errors.New("monitoring process exited unexpectedly")
+
 // object used to interact with a Proxmox instance
 type Pve struct {
 	cfg        *config.Config
@@ -129,22 +131,23 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 	if vm.MonitorCmd == "" {
 		return errors.New("missing monitoring command")
 	}
-	strCmd := fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " "))
+	strCmd := monitorCommand(vm)
 	slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
 	if p.cfg.DryRun {
 		slog.Info(fmt.Sprintf("DRY RUN: %s", strCmd))
 		return nil
 	}
-	round := 0
+	attempts := 0
 	for {
-		if round >= p.cfg.CmdRetryTimes && !forever {
-			slog.Error(fmt.Sprintf("monitoring of %s/%d failed %d times: giving up", vm.Type, vm.Id, round))
-			break
-		}
-		if round > 0 {
+		if attempts > 0 {
 			// the process failed to run: try again after a delay
-			slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (run %d of %d)",
-				strCmd, p.cfg.CmdRetryDelay, round, p.cfg.CmdRetryTimes))
+			if forever {
+				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d)",
+					strCmd, p.cfg.CmdRetryDelay, attempts))
+			} else {
+				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d of %d)",
+					strCmd, p.cfg.CmdRetryDelay, attempts, p.cfg.CmdRetryTimes))
+			}
 			timer := time.NewTimer(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 			select {
 			case <-ctx.Done():
@@ -158,18 +161,32 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 			case <-timer.C:
 			}
 		}
-		round++
+		attempts++
 		err := p.runProcess(ctx, vm)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err != nil {
-			vm.stateMu.Lock()
-			vm.lastError = err
-			vm.stateMu.Unlock()
+		if err == nil {
+			err = errMonitorExited
+		}
+		vm.stateMu.Lock()
+		vm.lastError = err
+		vm.stateMu.Unlock()
+		if !forever && attempts > p.cfg.CmdRetryTimes {
+			terminalErr := fmt.Errorf("monitoring of %s/%d failed after %d attempt(s): %w",
+				vm.Type, vm.Id, attempts, err)
+			slog.Error(terminalErr.Error())
+			return terminalErr
 		}
 	}
-	return nil
+}
+
+func monitorCommand(vm *VM) string {
+	return strings.TrimSpace(fmt.Sprintf("%s %s", vm.MonitorCmd, strings.Join(vm.MonitorArgs, " ")))
+}
+
+func (p *Pve) logDryRunMonitor(vm *VM) {
+	slog.Info(fmt.Sprintf("DRY RUN: %s", monitorCommand(vm)))
 }
 
 func (p *Pve) startManagedMonitor(vm *VM, forever, self bool) bool {
@@ -255,6 +272,10 @@ func (p *Pve) pveSelfMonitoring() error {
 			"--output",
 			"json",
 		},
+	}
+	if p.cfg.DryRun {
+		p.logDryRunMonitor(&vm)
+		return nil
 	}
 	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
 		ServiceName: vm.Name,
@@ -442,6 +463,10 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 
 // run the monitoring process of a VM
 func (p *Pve) StartVMMonitoring(vm *VM) {
+	if p.cfg.DryRun {
+		p.logDryRunMonitor(vm)
+		return
+	}
 	// ensure VM is known (and logger created) first
 	stored := p.UpdateVM(vm)
 	if stored.Logger != nil && p.startManagedMonitor(stored, false, false) {
