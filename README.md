@@ -36,6 +36,8 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 **pve2otelcol** has numerous other command line options, see `./pve2otelcol --help` for more information. The defaults should be reasonable values in most of the cases.
 
+The URL for the selected exporter must include an explicit `http` or `https` scheme and a host. Invalid option values and inconsistent retry intervals are rejected before monitoring starts.
+
 ### TLS
 
 Use an `https` endpoint to verify the collector with the host's system CA certificates:
