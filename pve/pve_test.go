@@ -1,11 +1,14 @@
 package pve
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -321,6 +324,69 @@ func TestStopVMMonitoringCancelsAndWaitsForMonitor(t *testing.T) {
 	call.vm.stateMu.Unlock()
 	if running || stopping || cancel != nil {
 		t.Errorf("final monitor state = running:%t stopping:%t cancel:%v, want stopped", running, stopping, cancel)
+	}
+}
+
+func TestMonitorCommandCancellationKillsProcessGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	vm := &VM{
+		MonitorCmd:  "/bin/sh",
+		MonitorArgs: []string{"-c", "sleep 60 & echo ready; wait"},
+	}
+	cmd := newMonitorCommand(ctx, vm)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe() error = %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	reader := bufio.NewReader(stdout)
+	if line, err := reader.ReadString('\n'); err != nil || line != "ready\n" {
+		t.Fatalf("process readiness = %q, %v; want ready", line, err)
+	}
+	processGroupID := cmd.Process.Pid
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+		_ = cmd.Wait()
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor process group did not exit after cancellation")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := syscall.Kill(-processGroupID, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("monitor process group %d still exists after cancellation: %v", processGroupID, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStopDoesNotBlockOnTickerNotification(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	p.ticker = time.NewTicker(time.Hour)
+	p.quitTicker = make(chan struct{})
+	stopReturned := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopReturned)
+	}()
+
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked notifying a ticker with no active receiver")
 	}
 }
 

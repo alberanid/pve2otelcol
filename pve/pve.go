@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -53,6 +54,7 @@ type loggerShutdown func(context.Context, *ologgers.OLogger) error
 var errMonitorExited = errors.New("monitoring process exited unexpectedly")
 
 const loggerShutdownTimeout = 5 * time.Second
+const monitorCommandWaitDelay = 5 * time.Second
 
 // object used to interact with a Proxmox instance
 type Pve struct {
@@ -60,7 +62,7 @@ type Pve struct {
 	knownVMs       VMs
 	knownVMsMu     sync.RWMutex
 	ticker         *time.Ticker
-	quitTicker     chan bool
+	quitTicker     chan struct{}
 	newLogger      loggerFactory
 	runMonitor     monitorRunner
 	runProcess     processRunner
@@ -123,7 +125,7 @@ func (p *Pve) shutdownVMLogger(vm *VM) {
 
 // execute the command to get and parse logs from a VM
 func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
-	cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
+	cmd := newMonitorCommand(ctx, vm)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
@@ -159,6 +161,26 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 		slog.Error(fmt.Sprintf("failure running monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
 	}
 	return err
+}
+
+func newMonitorCommand(ctx context.Context, vm *VM) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
+	// pct exec starts additional processes, including journalctl. Put the whole
+	// tree in a dedicated process group so cancellation cannot leave a
+	// descendant holding stdout open and blocking scanner/Wait indefinitely.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = monitorCommandWaitDelay
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	return cmd
 }
 
 // run a command inside a VM and parse its output that will be sent to a OTLP collector
@@ -590,12 +612,12 @@ func (p *Pve) periodicRefresh() {
 		return
 	}
 	p.ticker = time.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
-	quitTicker := make(chan bool)
+	quitTicker := make(chan struct{})
 	p.quitTicker = quitTicker
 	go func() {
 		for {
 			select {
-			case <-p.quitTicker:
+			case <-quitTicker:
 				// was asked to stop
 				return
 			case <-p.ticker.C:
@@ -652,7 +674,8 @@ func (p *Pve) Stop() {
 		p.ticker.Stop()
 	}
 	if p.quitTicker != nil {
-		p.quitTicker <- true
+		close(p.quitTicker)
+		p.quitTicker = nil
 	}
 
 	// collect ids first under lock to avoid holding lock while removing
