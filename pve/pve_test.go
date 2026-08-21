@@ -834,3 +834,166 @@ func TestRefreshesAreSerialized(t *testing.T) {
 
 	p.Stop()
 }
+
+func TestRunVMMonitoringAcceptsLargeJournalRecord(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	const payloadSize = 128 * 1024
+	var captured interface{}
+	p.logRecord = func(_ *ologgers.OLogger, record interface{}) {
+		captured = record
+	}
+	vm := &VM{
+		Id:         120,
+		Type:       "lxc",
+		MonitorCmd: "/bin/sh",
+		MonitorArgs: []string{
+			"-c",
+			"printf '\"'; head -c 131072 /dev/zero | tr '\\000' x; printf '\"\\n'",
+		},
+	}
+
+	if err := p.runVMMonitoring(context.Background(), vm); err != nil {
+		t.Fatalf("runVMMonitoring() error = %v", err)
+	}
+	got, ok := captured.(string)
+	if !ok {
+		t.Fatalf("captured record type = %T, want string", captured)
+	}
+	if len(got) != payloadSize {
+		t.Fatalf("captured payload length = %d, want %d", len(got), payloadSize)
+	}
+}
+
+func TestRunVMMonitoringRejectsRecordOverLimitAndTerminatesChild(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	var logged atomic.Int32
+	p.logRecord = func(_ *ologgers.OLogger, _ interface{}) {
+		logged.Add(1)
+	}
+	vm := &VM{
+		Id:         121,
+		Type:       "lxc",
+		MonitorCmd: "/bin/sh",
+		MonitorArgs: []string{
+			"-c",
+			"head -c 1048577 /dev/zero | tr '\\000' x; sleep 60",
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.runVMMonitoring(context.Background(), vm)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "read monitoring output of lxc/121") {
+			t.Fatalf("runVMMonitoring() error = %v, want record-size read error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runVMMonitoring blocked after oversized record")
+	}
+	if got := logged.Load(); got != 0 {
+		t.Fatalf("records logged over the size limit = %d, want 0", got)
+	}
+}
+
+func TestRunVMMonitoringFallsBackToStringForMalformedJSON(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	var captured interface{}
+	p.logRecord = func(_ *ologgers.OLogger, record interface{}) {
+		captured = record
+	}
+	vm := &VM{
+		Id:          122,
+		Type:        "lxc",
+		MonitorCmd:  "/bin/sh",
+		MonitorArgs: []string{"-c", "printf 'not-json\\n'"},
+	}
+
+	if err := p.runVMMonitoring(context.Background(), vm); err != nil {
+		t.Fatalf("runVMMonitoring() error = %v", err)
+	}
+	if got, ok := captured.(string); !ok || got != "not-json" {
+		t.Fatalf("captured record = %#v, want malformed line as string", captured)
+	}
+}
+
+func TestRunVMMonitoringReturnsNilAtCleanEOF(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	logged := 0
+	p.logRecord = func(_ *ologgers.OLogger, _ interface{}) {
+		logged++
+	}
+	vm := &VM{
+		Id:          123,
+		Type:        "lxc",
+		MonitorCmd:  "/bin/sh",
+		MonitorArgs: []string{"-c", "printf '{\"MESSAGE\":\"done\"}\\n'"},
+	}
+
+	if err := p.runVMMonitoring(context.Background(), vm); err != nil {
+		t.Fatalf("runVMMonitoring() error = %v", err)
+	}
+	if logged != 1 {
+		t.Fatalf("logged records = %d, want 1", logged)
+	}
+}
+
+func TestRunVMMonitoringReturnsContextErrorOnCancellation(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	recordLogged := make(chan struct{})
+	p.logRecord = func(_ *ologgers.OLogger, _ interface{}) {
+		close(recordLogged)
+	}
+	vm := &VM{
+		Id:          124,
+		Type:        "lxc",
+		MonitorCmd:  "/bin/sh",
+		MonitorArgs: []string{"-c", "printf '{\"MESSAGE\":\"ready\"}\\n'; sleep 60"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- p.runVMMonitoring(ctx, vm)
+	}()
+	select {
+	case <-recordLogged:
+	case <-time.After(time.Second):
+		t.Fatal("monitor command did not become ready")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runVMMonitoring() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runVMMonitoring did not return after cancellation")
+	}
+}
+
+func TestRunVMMonitoringIncludesBoundedStderrOnChildError(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	p.logRecord = func(_ *ologgers.OLogger, _ interface{}) {}
+	vm := &VM{
+		Id:         125,
+		Type:       "lxc",
+		MonitorCmd: "/bin/sh",
+		MonitorArgs: []string{
+			"-c",
+			"{ printf 'diagnostic: '; head -c 65536 /dev/zero | tr '\\000' e; } >&2; exit 7",
+		},
+	}
+
+	err := p.runVMMonitoring(context.Background(), vm)
+	if err == nil {
+		t.Fatal("runVMMonitoring() error = nil, want child-process error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "diagnostic:") || !strings.Contains(message, "[truncated]") {
+		t.Fatalf("runVMMonitoring() error lacks bounded stderr details: %v", err)
+	}
+	if len(message) > maxMonitorStderrSize+512 {
+		t.Fatalf("runVMMonitoring() error length = %d, stderr was not bounded", len(message))
+	}
+}

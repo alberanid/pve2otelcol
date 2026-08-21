@@ -2,6 +2,7 @@ package pve
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,38 @@ var errMonitorExited = errors.New("monitoring process exited unexpectedly")
 
 const loggerShutdownTimeout = 5 * time.Second
 const monitorCommandWaitDelay = 5 * time.Second
+const initialJournalRecordBufferSize = 64 * 1024
+const maxJournalRecordSize = 1024 * 1024
+const maxMonitorStderrSize = 32 * 1024
+
+type boundedBuffer struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := b.limit - b.buffer.Len()
+	if remaining <= 0 {
+		b.truncated = b.truncated || len(data) > 0
+		return written, nil
+	}
+	if len(data) > remaining {
+		b.truncated = true
+		data = data[:remaining]
+	}
+	_, _ = b.buffer.Write(data)
+	return written, nil
+}
+
+func (b *boundedBuffer) summary() string {
+	summary := strings.TrimSpace(b.buffer.String())
+	if b.truncated {
+		summary += " [truncated]"
+	}
+	return summary
+}
 
 // object used to interact with a Proxmox instance
 type Pve struct {
@@ -71,6 +104,7 @@ type Pve struct {
 	shutdownLogger loggerShutdown
 	discoverVMs    vmDiscovery
 	refreshMu      sync.Mutex
+	logRecord      func(*ologgers.OLogger, interface{})
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -96,6 +130,9 @@ func New(cfg *config.Config) *Pve {
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
 	pve.discoverVMs = pve.CurrentVMs
+	pve.logRecord = func(logger *ologgers.OLogger, record interface{}) {
+		logger.Log(record)
+	}
 	pve.shutdownLogger = func(ctx context.Context, logger *ologgers.OLogger) error {
 		return logger.Shutdown(ctx)
 	}
@@ -131,18 +168,22 @@ func (p *Pve) shutdownVMLogger(vm *VM) {
 // execute the command to get and parse logs from a VM
 func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 	cmd := newMonitorCommand(ctx, vm)
+	stderr := &boundedBuffer{limit: maxMonitorStderrSize}
+	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure opening standard output of %s/%d: %v", vm.Type, vm.Id, err))
-		return err
+		return fmt.Errorf("open monitoring stdout for %s/%d: %w", vm.Type, vm.Id, err)
 	}
 	err = cmd.Start()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure starting monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
-		return err
+		return fmt.Errorf("start monitoring command for %s/%d: %w", vm.Type, vm.Id, err)
 	}
 	seenError := false
 	scanner := bufio.NewScanner(stdout)
+	// journald fields can contain large payloads. Accept records up to 1 MiB,
+	// then fail the attempt instead of silently ending the stream.
+	// Scanner also needs room for the line delimiter beyond the record itself.
+	scanner.Buffer(make([]byte, initialJournalRecordBufferSize), maxJournalRecordSize+1)
 	for scanner.Scan() {
 		line := scanner.Text()
 		var jData interface{}
@@ -153,19 +194,44 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 					vm.Type, vm.Id, err))
 				seenError = true
 			}
-			vm.Logger.Log(line)
+			p.logRecord(vm.Logger, line)
 		} else {
-			vm.Logger.Log(jData)
+			p.logRecord(vm.Logger, jData)
 		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		// A read failure can leave journalctl blocked on a full stdout pipe. Kill
+		// the process group before Wait so pct descendants cannot hold it open.
+		cancelErr := cmd.Cancel()
+		_ = cmd.Wait()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := fmt.Errorf("read monitoring output of %s/%d: %w", vm.Type, vm.Id, scanErr)
+		if cancelErr != nil && !errors.Is(cancelErr, os.ErrProcessDone) {
+			err = errors.Join(err, fmt.Errorf("terminate monitoring command: %w", cancelErr))
+		}
+		return withMonitorStderr(err, stderr)
 	}
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure running monitoring command of %s/%d: %v", vm.Type, vm.Id, err))
+		return withMonitorStderr(
+			fmt.Errorf("run monitoring command of %s/%d: %w", vm.Type, vm.Id, err),
+			stderr,
+		)
 	}
-	return err
+	return nil
+}
+
+func withMonitorStderr(err error, stderr *boundedBuffer) error {
+	summary := stderr.summary()
+	if summary == "" {
+		return err
+	}
+	return fmt.Errorf("%w; stderr: %q", err, summary)
 }
 
 func newMonitorCommand(ctx context.Context, vm *VM) *exec.Cmd {
@@ -200,15 +266,16 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 		return nil
 	}
 	attempts := 0
+	var lastErr error
 	for {
 		if attempts > 0 {
 			// the process failed to run: try again after a delay
 			if forever {
 				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d)",
-					strCmd, p.cfg.CmdRetryDelay, attempts))
+					strCmd, p.cfg.CmdRetryDelay, attempts), "error", lastErr)
 			} else {
 				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d of %d)",
-					strCmd, p.cfg.CmdRetryDelay, attempts, p.cfg.CmdRetryTimes))
+					strCmd, p.cfg.CmdRetryDelay, attempts, p.cfg.CmdRetryTimes), "error", lastErr)
 			}
 			timer := time.NewTimer(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 			select {
@@ -231,6 +298,7 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 		if err == nil {
 			err = errMonitorExited
 		}
+		lastErr = err
 		vm.stateMu.Lock()
 		vm.lastError = err
 		vm.stateMu.Unlock()
