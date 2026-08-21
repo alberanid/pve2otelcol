@@ -10,12 +10,10 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/alberanid/pve2otelcol/config"
@@ -99,19 +97,24 @@ func (b *boundedBuffer) summary() string {
 
 // object used to interact with a Proxmox instance
 type Pve struct {
-	cfg            *config.Config
-	knownVMs       VMs
-	knownVMsMu     sync.RWMutex
-	ticker         *time.Ticker
-	quitTicker     chan struct{}
-	newLogger      loggerFactory
-	runMonitor     monitorRunner
-	runProcess     processRunner
-	shutdownLogger loggerShutdown
-	discoverVMs    vmDiscovery
-	refreshMu      sync.Mutex
-	logRecord      func(*ologgers.OLogger, interface{})
-	cursorStore    cursorStore
+	cfg                    *config.Config
+	knownVMs               VMs
+	knownVMsMu             sync.RWMutex
+	ticker                 ticker
+	quitTicker             chan struct{}
+	commands               commandRunner
+	newProcess             processFactory
+	clock                  clock
+	newLogger              loggerFactory
+	runMonitor             monitorRunner
+	runProcess             processRunner
+	shutdownLogger         loggerShutdown
+	discoverVMs            vmDiscovery
+	refreshMu              sync.Mutex
+	logRecord              func(*ologgers.OLogger, interface{})
+	cursorStore            cursorStore
+	capabilitiesMu         sync.Mutex
+	journalctlCapabilities map[int]string
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -127,12 +130,16 @@ type Pve struct {
 func New(cfg *config.Config) *Pve {
 	ctx, cancel := context.WithCancel(context.Background())
 	pve := &Pve{
-		cfg:       cfg,
-		knownVMs:  VMs{},
-		newLogger: ologgers.New,
-		ctx:       ctx,
-		cancel:    cancel,
-		stopDone:  make(chan struct{}),
+		cfg:                    cfg,
+		knownVMs:               VMs{},
+		commands:               execCommandRunner{},
+		newProcess:             newExecProcess,
+		clock:                  realClock{},
+		newLogger:              ologgers.New,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		stopDone:               make(chan struct{}),
+		journalctlCapabilities: make(map[int]string),
 	}
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
@@ -180,9 +187,9 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 	}
 	defer p.persistCursor(vm, true)
 
-	cmd := newMonitorCommand(ctx, vm)
+	cmd := p.newProcess(ctx, vm.MonitorCmd, monitorArgsWithCursor(vm)...)
 	stderr := &boundedBuffer{limit: maxMonitorStderrSize}
-	cmd.Stderr = stderr
+	cmd.SetStderr(stderr)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("open monitoring stdout for %s/%d: %w", vm.Type, vm.Id, err)
@@ -248,26 +255,6 @@ func withMonitorStderr(err error, stderr *boundedBuffer) error {
 	return fmt.Errorf("%w; stderr: %q", err, summary)
 }
 
-func newMonitorCommand(ctx context.Context, vm *VM) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, vm.MonitorCmd, monitorArgsWithCursor(vm)...)
-	// pct exec starts additional processes, including journalctl. Put the whole
-	// tree in a dedicated process group so cancellation cannot leave a
-	// descendant holding stdout open and blocking scanner/Wait indefinitely.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = monitorCommandWaitDelay
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
-	return cmd
-}
-
 // run a command inside a VM and parse its output that will be sent to a OTLP collector
 func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) error {
 	if vm.MonitorCmd == "" {
@@ -291,17 +278,17 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d of %d)",
 					strCmd, p.cfg.CmdRetryDelay, attempts, p.cfg.CmdRetryTimes), "error", lastErr)
 			}
-			timer := time.NewTimer(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
+			timer := p.clock.NewTimer(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 			select {
 			case <-ctx.Done():
 				if !timer.Stop() {
 					select {
-					case <-timer.C:
+					case <-timer.Chan():
 					default:
 					}
 				}
 				return ctx.Err()
-			case <-timer.C:
+			case <-timer.Chan():
 			}
 		}
 		attempts++
@@ -441,12 +428,18 @@ func (p *Pve) pveSelfMonitoring() error {
 }
 
 // check whether journalctl is available inside an LXC container
-func (p *Pve) lxcHasJournalctl(strId string) (bool, error) {
-	out, err := exec.Command(
-		"pct", "exec", strId, "--", "sh", "-c",
+func (p *Pve) lxcHasJournalctl(strID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.cfg.CapabilityProbeTimeout)*time.Second)
+	defer cancel()
+	out, err := p.commands.Output(
+		ctx,
+		"pct", "exec", strID, "--", "sh", "-c",
 		"if command -v journalctl >/dev/null 2>&1; then printf yes; else printf no; fi",
-	).Output()
+	)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return false, fmt.Errorf("timed out after %s: %w", time.Duration(p.cfg.CapabilityProbeTimeout)*time.Second, ctx.Err())
+		}
 		return false, err
 	}
 	switch strings.TrimSpace(string(out)) {
@@ -457,6 +450,52 @@ func (p *Pve) lxcHasJournalctl(strId string) (bool, error) {
 	default:
 		return false, fmt.Errorf("unexpected journalctl probe output %q", strings.TrimSpace(string(out)))
 	}
+}
+
+type pveResource struct {
+	VMID   int    `json:"vmid"`
+	Name   string `json:"name"`
+	Node   string `json:"node"`
+	Status string `json:"status"`
+	Type   string `json:"type"`
+}
+
+func (p *Pve) currentResources() ([]pveResource, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.cfg.DiscoveryTimeout)*time.Second)
+	defer cancel()
+	out, err := p.commands.Output(ctx, "pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json")
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("resource discovery timed out after %s: %w", time.Duration(p.cfg.DiscoveryTimeout)*time.Second, ctx.Err())
+		}
+		return nil, fmt.Errorf("list Proxmox resources: %w", err)
+	}
+	var resources []pveResource
+	if err := json.Unmarshal(out, &resources); err != nil {
+		return nil, fmt.Errorf("parse Proxmox resource JSON: %w", err)
+	}
+	for i, resource := range resources {
+		if resource.VMID <= 0 || resource.Type == "" || resource.Node == "" {
+			return nil, fmt.Errorf("parse Proxmox resource JSON item %d: missing valid vmid, type, or node", i)
+		}
+	}
+	return resources, nil
+}
+
+func lxcIdentity(resource pveResource) string {
+	return fmt.Sprintf("%s/lxc/%d/%s", resource.Node, resource.VMID, resource.Name)
+}
+
+func (p *Pve) cachedLXCJournalctl(id int, identity string) bool {
+	p.capabilitiesMu.Lock()
+	defer p.capabilitiesMu.Unlock()
+	return p.journalctlCapabilities[id] == identity
+}
+
+func (p *Pve) cacheLXCJournalctl(id int, identity string) {
+	p.capabilitiesMu.Lock()
+	p.journalctlCapabilities[id] = identity
+	p.capabilitiesMu.Unlock()
 }
 
 // check id against the include and exclude lists
@@ -474,48 +513,42 @@ func (p *Pve) checkLists(id int) bool {
 func (p *Pve) CurrentLXCs() (VMs, error) {
 	slog.Debug("updating list of running LXCs")
 	vms := VMs{}
-	out, err := exec.Command("pct", "list").Output()
+	resources, err := p.currentResources()
 	if err != nil {
-		return nil, fmt.Errorf("list LXCs: %w", err)
+		return nil, err
 	}
-	outStr := string(out)
-	for lineNumber, line := range strings.Split(outStr, "\n") {
-		items := strings.Fields(line)
-		if len(items) == 0 || items[0] == "VMID" {
+	node, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("determine local node for LXC discovery: %w", err)
+	}
+	for _, resource := range resources {
+		if resource.Type != "lxc" || resource.Node != node || resource.Status != "running" {
 			continue
 		}
-		if len(items) < 3 {
-			return nil, fmt.Errorf("parse pct list line %d: expected at least 3 fields, got %d", lineNumber+1, len(items))
-		}
-		strId := items[0]
-		state := items[1]
-		name := items[2]
-		id, err := strconv.Atoi(strId)
-		if err != nil {
-			return nil, fmt.Errorf("parse pct list line %d VMID %q: %w", lineNumber+1, strId, err)
-		}
-		if state != "running" {
+		if !p.checkLists(resource.VMID) {
 			continue
 		}
-		if !p.checkLists(id) {
-			continue
+		identity := lxcIdentity(resource)
+		if !p.cachedLXCJournalctl(resource.VMID, identity) {
+			hasJournalctl, err := p.lxcHasJournalctl(strconv.Itoa(resource.VMID))
+			if err != nil {
+				return nil, fmt.Errorf("probe lxc/%d for journalctl: %w", resource.VMID, err)
+			}
+			if !hasJournalctl {
+				slog.Debug(fmt.Sprintf("skipping lxc/%d: journalctl not found", resource.VMID))
+				continue
+			}
+			p.cacheLXCJournalctl(resource.VMID, identity)
 		}
-		hasJournalctl, err := p.lxcHasJournalctl(strId)
-		if err != nil {
-			return nil, fmt.Errorf("probe lxc/%d for journalctl: %w", id, err)
-		}
-		if !hasJournalctl {
-			slog.Debug(fmt.Sprintf("skipping lxc/%d: journalctl not found", id))
-			continue
-		}
-		vms[id] = &VM{
-			Id:         id,
-			Name:       name,
+		strID := strconv.Itoa(resource.VMID)
+		vms[resource.VMID] = &VM{
+			Id:         resource.VMID,
+			Name:       resource.Name,
 			Type:       "lxc",
 			MonitorCmd: "pct",
 			MonitorArgs: []string{
 				"exec",
-				strId,
+				strID,
 				"--",
 				"journalctl",
 				"--lines",
@@ -533,40 +566,27 @@ func (p *Pve) CurrentLXCs() (VMs, error) {
 func (p *Pve) CurrentKVMs() (VMs, error) {
 	slog.Debug("updating list of running KVMs")
 	vms := VMs{}
-	out, err := exec.Command("qm", "list").Output()
+	resources, err := p.currentResources()
 	if err != nil {
-		return nil, fmt.Errorf("list KVMs: %w", err)
+		return nil, err
 	}
-	outStr := string(out)
-	for lineNumber, line := range strings.Split(outStr, "\n") {
-		items := strings.Fields(line)
-		if len(items) == 0 || items[0] == "VMID" {
+	node, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("determine local node for KVM discovery: %w", err)
+	}
+	for _, resource := range resources {
+		if resource.Type != "qemu" || resource.Node != node || resource.Status != "running" || !p.checkLists(resource.VMID) {
 			continue
 		}
-		if len(items) < 3 {
-			return nil, fmt.Errorf("parse qm list line %d: expected at least 3 fields, got %d", lineNumber+1, len(items))
-		}
-		strId := items[0]
-		name := items[1]
-		state := items[2]
-		id, err := strconv.Atoi(strId)
-		if err != nil {
-			return nil, fmt.Errorf("parse qm list line %d VMID %q: %w", lineNumber+1, strId, err)
-		}
-		if state != "running" {
-			continue
-		}
-		if !p.checkLists(id) {
-			continue
-		}
-		vms[id] = &VM{
-			Id:         id,
-			Name:       name,
+		strID := strconv.Itoa(resource.VMID)
+		vms[resource.VMID] = &VM{
+			Id:         resource.VMID,
+			Name:       resource.Name,
 			Type:       "qm",
 			MonitorCmd: "qm",
 			MonitorArgs: []string{
 				"exec",
-				strId,
+				strID,
 				"--",
 				"journalctl",
 				"--lines",
@@ -740,7 +760,7 @@ func (p *Pve) periodicRefresh() {
 	if p.cfg.RefreshInterval == 0 {
 		return
 	}
-	p.ticker = time.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
+	p.ticker = p.clock.NewTicker(time.Duration(p.cfg.RefreshInterval) * time.Second)
 	quitTicker := make(chan struct{})
 	p.quitTicker = quitTicker
 	go func() {
@@ -749,7 +769,7 @@ func (p *Pve) periodicRefresh() {
 			case <-quitTicker:
 				// was asked to stop
 				return
-			case <-p.ticker.C:
+			case <-p.ticker.Chan():
 				// periodic task
 				p.refreshVMsMonitoringAndLog()
 			}

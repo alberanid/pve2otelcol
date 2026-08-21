@@ -204,7 +204,7 @@ func (p *Pve) advanceCursor(vm *VM, record interface{}) {
 }
 
 func (p *Pve) persistCursor(vm *VM, force bool) {
-	now := time.Now()
+	now := p.clock.Now()
 	vm.cursorMu.Lock()
 	if vm.cursor == "" || vm.cursor == vm.persistedCursor {
 		vm.cursorMu.Unlock()

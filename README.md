@@ -38,6 +38,8 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 The URL for the selected exporter must include an explicit `http` or `https` scheme and a host. Invalid option values and inconsistent retry intervals are rejected before monitoring starts.
 
+LXC discovery uses the local Proxmox API through `pvesh` and consumes its JSON output. Discovery commands are limited to 10 seconds by default (`--discovery-timeout`), while guest `journalctl` capability probes are limited to 5 seconds (`--capability-probe-timeout`). A successful probe is reused on later refreshes until the discovered container identity changes; a missing capability is checked again so installing `journalctl` does not require restarting the service.
+
 ### TLS
 
 Use an `https` endpoint to verify the collector with the host's system CA certificates:

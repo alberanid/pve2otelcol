@@ -122,6 +122,12 @@ func TestParseArgsUsesDefaults(t *testing.T) {
 	if cfg.RefreshInterval != DEFAULT_REFRESH_INTERVAL {
 		t.Errorf("refresh interval = %d, want %d", cfg.RefreshInterval, DEFAULT_REFRESH_INTERVAL)
 	}
+	if cfg.DiscoveryTimeout != DEFAULT_DISCOVERY_TIMEOUT {
+		t.Errorf("discovery timeout = %d, want %d", cfg.DiscoveryTimeout, DEFAULT_DISCOVERY_TIMEOUT)
+	}
+	if cfg.CapabilityProbeTimeout != DEFAULT_CAPABILITY_PROBE_TIMEOUT {
+		t.Errorf("capability probe timeout = %d, want %d", cfg.CapabilityProbeTimeout, DEFAULT_CAPABILITY_PROBE_TIMEOUT)
+	}
 }
 
 func TestParseArgsUsesIndependentFlagSets(t *testing.T) {
@@ -326,6 +332,10 @@ func TestValidateNumericValuesAndRelationships(t *testing.T) {
 		{"negative refresh interval", func(c *Config) { c.RefreshInterval = -1 }, "refresh-interval"},
 		{"negative command retry count", func(c *Config) { c.CmdRetryTimes = -1 }, "cmd-retry-times"},
 		{"negative command retry delay", func(c *Config) { c.CmdRetryDelay = -1 }, "cmd-retry-delay"},
+		{"zero discovery timeout", func(c *Config) { c.DiscoveryTimeout = 0 }, "discovery-timeout"},
+		{"negative discovery timeout", func(c *Config) { c.DiscoveryTimeout = -1 }, "discovery-timeout"},
+		{"zero capability probe timeout", func(c *Config) { c.CapabilityProbeTimeout = 0 }, "capability-probe-timeout"},
+		{"negative capability probe timeout", func(c *Config) { c.CapabilityProbeTimeout = -1 }, "capability-probe-timeout"},
 	}
 
 	for _, tt := range tests {
@@ -372,5 +382,7 @@ func validConfig() Config {
 		RefreshInterval:            DEFAULT_REFRESH_INTERVAL,
 		CmdRetryTimes:              DEFAULT_CMD_RETRY_TIMES,
 		CmdRetryDelay:              DEFAULT_CMD_RETRY_DELAY,
+		DiscoveryTimeout:           DEFAULT_DISCOVERY_TIMEOUT,
+		CapabilityProbeTimeout:     DEFAULT_CAPABILITY_PROBE_TIMEOUT,
 	}
 }

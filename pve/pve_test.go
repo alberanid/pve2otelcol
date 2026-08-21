@@ -100,8 +100,10 @@ func newTestPve(t *testing.T) (*Pve, *loggerFactoryStub, *monitorRunnerStub) {
 	t.Helper()
 
 	p := New(&config.Config{
-		SkipLXCs:        true,
-		RefreshInterval: 0,
+		SkipLXCs:               true,
+		RefreshInterval:        0,
+		DiscoveryTimeout:       config.DEFAULT_DISCOVERY_TIMEOUT,
+		CapabilityProbeTimeout: config.DEFAULT_CAPABILITY_PROBE_TIMEOUT,
 	})
 	loggerStub := &loggerFactoryStub{}
 	runnerStub := &monitorRunnerStub{calls: make(chan monitorCall, 10)}
@@ -333,7 +335,8 @@ func TestMonitorCommandCancellationKillsProcessGroup(t *testing.T) {
 		MonitorCmd:  "/bin/sh",
 		MonitorArgs: []string{"-c", "sleep 60 & echo ready; wait"},
 	}
-	cmd := newMonitorCommand(ctx, vm)
+	process := newExecProcess(ctx, vm.MonitorCmd, monitorArgsWithCursor(vm)...)
+	cmd := process.(*execProcess).cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("StdoutPipe() error = %v", err)
@@ -375,7 +378,7 @@ func TestMonitorCommandCancellationKillsProcessGroup(t *testing.T) {
 
 func TestStopDoesNotBlockOnTickerNotification(t *testing.T) {
 	p, _, _ := newTestPve(t)
-	p.ticker = time.NewTicker(time.Hour)
+	p.ticker = realTicker{Ticker: time.NewTicker(time.Hour)}
 	p.quitTicker = make(chan struct{})
 	stopReturned := make(chan struct{})
 	go func() {
