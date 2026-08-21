@@ -36,6 +36,8 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 **pve2otelcol** has numerous other command line options, see `./pve2otelcol --help` for more information. The defaults should be reasonable values in most of the cases.
 
+Journal cursors are checkpointed per source under `/var/lib/pve2otelcol/cursors` by default. When a monitoring command restarts, the saved cursor is passed to `journalctl --after-cursor`, so records written during the restart are replayed instead of skipped. Checkpoints advance only after a record has been handed to the OpenTelemetry logger; after an abrupt process or host failure, a short suffix may therefore be delivered more than once. Use `--cursor-dir` to select another state directory, or pass an empty value to disable persistence.
+
 ### Systemd unit
 
 To better integrate it with your PVE node, you can use the provided systemd unit file.

@@ -28,6 +28,7 @@ const DEFAULT_OTLP_BATCH_MAX_BATCH_SIZE = 512
 const DEFAULT_REFRESH_INTERVAL = 10
 const DEFAULT_CMD_RETRY_TIMES = 5
 const DEFAULT_CMD_RETRY_DELAY = 5
+const DEFAULT_CURSOR_DIR = "/var/lib/pve2otelcol/cursors"
 
 // store command line configuration.
 type Config struct {
@@ -50,6 +51,7 @@ type Config struct {
 	RefreshInterval int
 	CmdRetryTimes   int
 	CmdRetryDelay   int
+	CursorDir       string
 	SkipLXCs        bool
 	SkipPVE         bool
 	//SkipKVMs     	bool
@@ -112,6 +114,7 @@ func ParseArgs() *Config {
 	flag.IntVar(&c.RefreshInterval, "refresh-interval", DEFAULT_REFRESH_INTERVAL, "refresh interval in seconds")
 	flag.IntVar(&c.CmdRetryTimes, "cmd-retry-times", DEFAULT_CMD_RETRY_TIMES, "number of times a process is restarted before giving up")
 	flag.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
+	flag.StringVar(&c.CursorDir, "cursor-dir", DEFAULT_CURSOR_DIR, "directory used to persist journald cursors (empty disables persistence)")
 	flag.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not monitor LXCs virtuals")
 	flag.BoolVar(&c.SkipPVE, "skip-pve", false, "do not monitor this PVE node")
 	// it will be reintroduced if we'll find a way to get the stdout stream from a qm exec command.

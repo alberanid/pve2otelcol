@@ -39,6 +39,12 @@ type VM struct {
 	done           chan struct{}
 	lastError      error
 	loggerShutdown bool
+
+	cursorMu                 sync.Mutex
+	cursor                   string
+	persistedCursor          string
+	cursorLoaded             bool
+	lastCursorPersistAttempt time.Time
 }
 
 // map of VMID to VM information
@@ -105,6 +111,7 @@ type Pve struct {
 	discoverVMs    vmDiscovery
 	refreshMu      sync.Mutex
 	logRecord      func(*ologgers.OLogger, interface{})
+	cursorStore    cursorStore
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -130,6 +137,7 @@ func New(cfg *config.Config) *Pve {
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
 	pve.discoverVMs = pve.CurrentVMs
+	pve.cursorStore = newCursorStore(cfg.CursorDir)
 	pve.logRecord = func(logger *ologgers.OLogger, record interface{}) {
 		logger.Log(record)
 	}
@@ -167,6 +175,11 @@ func (p *Pve) shutdownVMLogger(vm *VM) {
 
 // execute the command to get and parse logs from a VM
 func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
+	if err := p.loadCursor(vm); err != nil {
+		return err
+	}
+	defer p.persistCursor(vm, true)
+
 	cmd := newMonitorCommand(ctx, vm)
 	stderr := &boundedBuffer{limit: maxMonitorStderrSize}
 	cmd.Stderr = stderr
@@ -197,6 +210,7 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 			p.logRecord(vm.Logger, line)
 		} else {
 			p.logRecord(vm.Logger, jData)
+			p.advanceCursor(vm, jData)
 		}
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
@@ -235,7 +249,7 @@ func withMonitorStderr(err error, stderr *boundedBuffer) error {
 }
 
 func newMonitorCommand(ctx context.Context, vm *VM) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, vm.MonitorCmd, vm.MonitorArgs...)
+	cmd := exec.CommandContext(ctx, vm.MonitorCmd, monitorArgsWithCursor(vm)...)
 	// pct exec starts additional processes, including journalctl. Put the whole
 	// tree in a dedicated process group so cancellation cannot leave a
 	// descendant holding stdout open and blocking scanner/Wait indefinitely.
