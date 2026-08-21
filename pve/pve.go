@@ -51,6 +51,8 @@ type processRunner func(context.Context, *VM) error
 
 type loggerShutdown func(context.Context, *ologgers.OLogger) error
 
+type vmDiscovery func() (VMs, error)
+
 var errMonitorExited = errors.New("monitoring process exited unexpectedly")
 
 const loggerShutdownTimeout = 5 * time.Second
@@ -67,6 +69,8 @@ type Pve struct {
 	runMonitor     monitorRunner
 	runProcess     processRunner
 	shutdownLogger loggerShutdown
+	discoverVMs    vmDiscovery
+	refreshMu      sync.Mutex
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -91,6 +95,7 @@ func New(cfg *config.Config) *Pve {
 	}
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
+	pve.discoverVMs = pve.CurrentVMs
 	pve.shutdownLogger = func(ctx context.Context, logger *ologgers.OLogger) error {
 		return logger.Shutdown(ctx)
 	}
@@ -354,9 +359,22 @@ func (p *Pve) pveSelfMonitoring() error {
 }
 
 // check whether journalctl is available inside an LXC container
-func (p *Pve) lxcHasJournalctl(strId string) bool {
-	err := exec.Command("pct", "exec", strId, "--", "which", "journalctl").Run()
-	return err == nil
+func (p *Pve) lxcHasJournalctl(strId string) (bool, error) {
+	out, err := exec.Command(
+		"pct", "exec", strId, "--", "sh", "-c",
+		"if command -v journalctl >/dev/null 2>&1; then printf yes; else printf no; fi",
+	).Output()
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "yes":
+		return true, nil
+	case "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected journalctl probe output %q", strings.TrimSpace(string(out)))
+	}
 }
 
 // check id against the include and exclude lists
@@ -371,34 +389,40 @@ func (p *Pve) checkLists(id int) bool {
 }
 
 // return a map containing the currently running LXCs
-func (p *Pve) CurrentLXCs() VMs {
+func (p *Pve) CurrentLXCs() (VMs, error) {
 	slog.Debug("updating list of running LXCs")
 	vms := VMs{}
 	out, err := exec.Command("pct", "list").Output()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure listing LXCs: %v", err))
-		return vms
+		return nil, fmt.Errorf("list LXCs: %w", err)
 	}
 	outStr := string(out)
-	for _, line := range strings.Split(outStr, "\n") {
+	for lineNumber, line := range strings.Split(outStr, "\n") {
 		items := strings.Fields(line)
-		if len(items) < 3 {
+		if len(items) == 0 || items[0] == "VMID" {
 			continue
+		}
+		if len(items) < 3 {
+			return nil, fmt.Errorf("parse pct list line %d: expected at least 3 fields, got %d", lineNumber+1, len(items))
 		}
 		strId := items[0]
 		state := items[1]
 		name := items[2]
-		if state != "running" {
-			continue
-		}
 		id, err := strconv.Atoi(strId)
 		if err != nil {
+			return nil, fmt.Errorf("parse pct list line %d VMID %q: %w", lineNumber+1, strId, err)
+		}
+		if state != "running" {
 			continue
 		}
 		if !p.checkLists(id) {
 			continue
 		}
-		if !p.lxcHasJournalctl(strId) {
+		hasJournalctl, err := p.lxcHasJournalctl(strId)
+		if err != nil {
+			return nil, fmt.Errorf("probe lxc/%d for journalctl: %w", id, err)
+		}
+		if !hasJournalctl {
 			slog.Debug(fmt.Sprintf("skipping lxc/%d: journalctl not found", id))
 			continue
 		}
@@ -420,32 +444,34 @@ func (p *Pve) CurrentLXCs() VMs {
 			},
 		}
 	}
-	return vms
+	return vms, nil
 }
 
 // return a map containing the currently running KVMs
-func (p *Pve) CurrentKVMs() VMs {
+func (p *Pve) CurrentKVMs() (VMs, error) {
 	slog.Debug("updating list of running KVMs")
 	vms := VMs{}
 	out, err := exec.Command("qm", "list").Output()
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure listing KVMs: %v", err))
-		return vms
+		return nil, fmt.Errorf("list KVMs: %w", err)
 	}
 	outStr := string(out)
-	for _, line := range strings.Split(outStr, "\n") {
+	for lineNumber, line := range strings.Split(outStr, "\n") {
 		items := strings.Fields(line)
-		if len(items) < 3 {
+		if len(items) == 0 || items[0] == "VMID" {
 			continue
+		}
+		if len(items) < 3 {
+			return nil, fmt.Errorf("parse qm list line %d: expected at least 3 fields, got %d", lineNumber+1, len(items))
 		}
 		strId := items[0]
 		name := items[1]
 		state := items[2]
-		if state != "running" {
-			continue
-		}
 		id, err := strconv.Atoi(strId)
 		if err != nil {
+			return nil, fmt.Errorf("parse qm list line %d VMID %q: %w", lineNumber+1, strId, err)
+		}
+		if state != "running" {
 			continue
 		}
 		if !p.checkLists(id) {
@@ -469,24 +495,32 @@ func (p *Pve) CurrentKVMs() VMs {
 			},
 		}
 	}
-	return vms
+	return vms, nil
 }
 
 // return a map containing the currently running LXCs and KVMs
-func (p *Pve) CurrentVMs() VMs {
+func (p *Pve) CurrentVMs() (VMs, error) {
 	vms := VMs{}
 	if !p.cfg.SkipLXCs {
-		maps.Copy(vms, p.CurrentLXCs())
+		lxcs, err := p.CurrentLXCs()
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(vms, lxcs)
 	}
 	/*
 		// right now KVMs are not monitored, since the qm exec command
 		// always block until the command exits, making it impossible to
 		// parse the output as a stream.
 		if !p.cfg.SkipKVMs {
-			maps.Copy(vms, p.CurrentKVMs())
+			kvms, err := p.CurrentKVMs()
+			if err != nil {
+				return nil, err
+			}
+			maps.Copy(vms, kvms)
 		}
 	*/
-	return vms
+	return vms, nil
 }
 
 // add the received VM to the list of known VMs, creating its logger service if needed
@@ -586,8 +620,14 @@ func (p *Pve) RemoveVM(id int) {
 }
 
 // refresh the map of running VMs
-func (p *Pve) RefreshVMsMonitoring() {
-	vms := p.CurrentVMs()
+func (p *Pve) RefreshVMsMonitoring() error {
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+
+	vms, err := p.discoverVMs()
+	if err != nil {
+		return fmt.Errorf("discover current VMs: %w", err)
+	}
 	for _, vm := range vms {
 		p.StartVMMonitoring(vm)
 	}
@@ -604,10 +644,17 @@ func (p *Pve) RefreshVMsMonitoring() {
 	for _, id := range remove {
 		p.RemoveVM(id)
 	}
+	return nil
+}
+
+func (p *Pve) refreshVMsMonitoringAndLog() {
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		slog.Error("unable to refresh VM monitoring", "error", err)
+	}
 }
 
 func (p *Pve) periodicRefresh() {
-	p.RefreshVMsMonitoring()
+	p.refreshVMsMonitoringAndLog()
 	if p.cfg.RefreshInterval == 0 {
 		return
 	}
@@ -622,7 +669,7 @@ func (p *Pve) periodicRefresh() {
 				return
 			case <-p.ticker.C:
 				// periodic task
-				p.RefreshVMsMonitoring()
+				p.refreshVMsMonitoringAndLog()
 			}
 		}
 	}()

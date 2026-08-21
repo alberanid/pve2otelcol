@@ -31,7 +31,9 @@ func main() {
 			p.Stop()
 			return
 		case <-refreshSig:
-			p.RefreshVMsMonitoring()
+			if err := p.RefreshVMsMonitoring(); err != nil {
+				slog.Error("unable to refresh VM monitoring", "error", err)
+			}
 		}
 	}
 }

@@ -702,3 +702,135 @@ func TestStopCancelsAndWaitsForAllMonitors(t *testing.T) {
 		t.Errorf("logger shutdown calls after second Stop = %d, want 2", calls)
 	}
 }
+
+func TestRefreshDiscoveryFailurePreservesRunningMonitor(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+
+	monitorCanceled := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		close(monitorCanceled)
+		return ctx.Err()
+	}
+
+	vm := &VM{Id: 110, Name: "existing", Type: "lxc", MonitorCmd: "journalctl"}
+	p.StartVMMonitoring(vm)
+	waitForMonitorCall(t, runnerStub)
+
+	discoveryErr := errors.New("pct temporarily unavailable")
+	p.discoverVMs = func() (VMs, error) {
+		return nil, discoveryErr
+	}
+
+	err := p.RefreshVMsMonitoring()
+	if !errors.Is(err, discoveryErr) {
+		t.Fatalf("RefreshVMsMonitoring() error = %v, want wrapped %v", err, discoveryErr)
+	}
+
+	p.knownVMsMu.RLock()
+	stored, ok := p.knownVMs[vm.Id]
+	p.knownVMsMu.RUnlock()
+	if !ok || stored != vm {
+		t.Fatal("discovery failure removed the existing monitor")
+	}
+	select {
+	case <-monitorCanceled:
+		t.Fatal("discovery failure canceled the existing monitor")
+	default:
+	}
+	if got := shutdownSpy.count(vm.Logger); got != 0 {
+		t.Fatalf("logger shutdown count after discovery failure = %d, want 0", got)
+	}
+
+	p.Stop()
+}
+
+func TestRefreshSuccessfulEmptySnapshotRemovesMonitor(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.logger = &ologgers.OLogger{}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+
+	monitorCanceled := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		close(monitorCanceled)
+		return ctx.Err()
+	}
+
+	vm := &VM{Id: 111, Name: "removed", Type: "lxc", MonitorCmd: "journalctl"}
+	p.StartVMMonitoring(vm)
+	waitForMonitorCall(t, runnerStub)
+	p.discoverVMs = func() (VMs, error) {
+		return VMs{}, nil
+	}
+
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		t.Fatalf("RefreshVMsMonitoring() error = %v", err)
+	}
+	select {
+	case <-monitorCanceled:
+	default:
+		t.Fatal("successful empty discovery did not cancel the monitor")
+	}
+	p.knownVMsMu.RLock()
+	_, ok := p.knownVMs[vm.Id]
+	p.knownVMsMu.RUnlock()
+	if ok {
+		t.Fatal("successful empty discovery left the monitor tracked")
+	}
+	if got := shutdownSpy.count(vm.Logger); got != 1 {
+		t.Fatalf("logger shutdown count = %d, want 1", got)
+	}
+
+	p.Stop()
+}
+
+func TestRefreshesAreSerialized(t *testing.T) {
+	p, _, _ := newTestPve(t)
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	var calls atomic.Int32
+	p.discoverVMs = func() (VMs, error) {
+		switch calls.Add(1) {
+		case 1:
+			close(firstEntered)
+			<-releaseFirst
+		case 2:
+			close(secondEntered)
+		}
+		return VMs{}, nil
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- p.RefreshVMsMonitoring() }()
+	<-firstEntered
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		errs <- p.RefreshVMsMonitoring()
+	}()
+	<-secondStarted
+
+	select {
+	case <-secondEntered:
+		t.Fatal("second discovery overlapped the first refresh")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("RefreshVMsMonitoring() error = %v", err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("discovery calls = %d, want 2", got)
+	}
+
+	p.Stop()
+}
