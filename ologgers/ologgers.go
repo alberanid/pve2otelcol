@@ -165,7 +165,8 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 
 		exporter, err = otlploggrpc.New(ctx, rpcOptions...)
 		if err != nil {
-			slog.Error(fmt.Sprintf("failure creating gRPC logger with options %v; error: %v", opts, err))
+			slog.Error("unable to create OTLP logger", "exporter", "grpc", "service_id", opts.ServiceId,
+				"service_name", opts.ServiceName, "error", err)
 			return nil, err
 		}
 	} else if cfg.OtlpExporter == "http" {
@@ -189,7 +190,8 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 
 		exporter, err = otlploghttp.New(ctx, httpOptions...)
 		if err != nil {
-			slog.Error(fmt.Sprintf("failure creating HTTP logger with options %v; error: %v", opts, err))
+			slog.Error("unable to create OTLP logger", "exporter", "http", "service_id", opts.ServiceId,
+				"service_name", opts.ServiceName, "error", err)
 			return nil, err
 		}
 	} else {
@@ -215,7 +217,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		),
 	)
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure setting service instance id of logger; error: %v", err))
+		slog.Error("unable to set logger service instance ID", "service_id", opts.ServiceId, "error", err)
 		return nil, err
 	}
 	providerResources, err = resource.Merge(
@@ -226,7 +228,7 @@ func New(cfg *config.Config, opts OLoggerOptions) (*OLogger, error) {
 		),
 	)
 	if err != nil {
-		slog.Error(fmt.Sprintf("failure setting service name of logger; error: %v", err))
+		slog.Error("unable to set logger service name", "service_name", opts.ServiceName, "error", err)
 		return nil, err
 	}
 

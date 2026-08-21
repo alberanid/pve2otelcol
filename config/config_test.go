@@ -128,6 +128,9 @@ func TestParseArgsUsesDefaults(t *testing.T) {
 	if cfg.CapabilityProbeTimeout != DEFAULT_CAPABILITY_PROBE_TIMEOUT {
 		t.Errorf("capability probe timeout = %d, want %d", cfg.CapabilityProbeTimeout, DEFAULT_CAPABILITY_PROBE_TIMEOUT)
 	}
+	if cfg.MetricsListenAddress != DEFAULT_METRICS_LISTEN_ADDRESS {
+		t.Errorf("metrics listen address = %q, want %q", cfg.MetricsListenAddress, DEFAULT_METRICS_LISTEN_ADDRESS)
+	}
 }
 
 func TestParseArgsUsesIndependentFlagSets(t *testing.T) {
@@ -219,7 +222,7 @@ func TestParseArgsHandlesHelpAndVersionWithoutExiting(t *testing.T) {
 func TestPrintUsage(t *testing.T) {
 	var output bytes.Buffer
 	PrintUsage(&output)
-	for _, want := range []string{"Usage: pve2otelcol [options]", "-otlp-exporter", "-otlp-tls-ca-file", "-refresh-interval"} {
+	for _, want := range []string{"Usage: pve2otelcol [options]", "-otlp-exporter", "-otlp-tls-ca-file", "-refresh-interval", "-metrics-listen-address"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("usage does not contain %q:\n%s", want, output.String())
 		}
@@ -336,6 +339,8 @@ func TestValidateNumericValuesAndRelationships(t *testing.T) {
 		{"negative discovery timeout", func(c *Config) { c.DiscoveryTimeout = -1 }, "discovery-timeout"},
 		{"zero capability probe timeout", func(c *Config) { c.CapabilityProbeTimeout = 0 }, "capability-probe-timeout"},
 		{"negative capability probe timeout", func(c *Config) { c.CapabilityProbeTimeout = -1 }, "capability-probe-timeout"},
+		{"metrics address without port", func(c *Config) { c.MetricsListenAddress = "localhost" }, "metrics-listen-address"},
+		{"metrics address with zero port", func(c *Config) { c.MetricsListenAddress = "localhost:0" }, "metrics-listen-address port"},
 	}
 
 	for _, tt := range tests {
@@ -359,6 +364,7 @@ func TestValidateAllowsDocumentedZeroValues(t *testing.T) {
 	cfg.RefreshInterval = 0
 	cfg.CmdRetryTimes = 0
 	cfg.CmdRetryDelay = 0
+	cfg.MetricsListenAddress = ""
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want nil for documented zero values", err)
@@ -384,5 +390,6 @@ func validConfig() Config {
 		CmdRetryDelay:              DEFAULT_CMD_RETRY_DELAY,
 		DiscoveryTimeout:           DEFAULT_DISCOVERY_TIMEOUT,
 		CapabilityProbeTimeout:     DEFAULT_CAPABILITY_PROBE_TIMEOUT,
+		MetricsListenAddress:       DEFAULT_METRICS_LISTEN_ADDRESS,
 	}
 }

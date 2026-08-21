@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"slices"
 	"strconv"
@@ -29,6 +30,7 @@ const DEFAULT_CMD_RETRY_TIMES = 5
 const DEFAULT_CMD_RETRY_DELAY = 5
 const DEFAULT_DISCOVERY_TIMEOUT = 10
 const DEFAULT_CAPABILITY_PROBE_TIMEOUT = 5
+const DEFAULT_METRICS_LISTEN_ADDRESS = "127.0.0.1:9221"
 const DEFAULT_CURSOR_DIR = "/var/lib/pve2otelcol/cursors"
 
 // store command line configuration.
@@ -55,6 +57,7 @@ type Config struct {
 	CmdRetryDelay          int
 	DiscoveryTimeout       int
 	CapabilityProbeTimeout int
+	MetricsListenAddress   string
 	CursorDir              string
 	SkipLXCs               bool
 	SkipPVE                bool
@@ -120,6 +123,7 @@ func newFlagSet(c *Config, monitorInclude, monitorExclude *string) *flag.FlagSet
 	flags.IntVar(&c.CmdRetryDelay, "cmd-retry-delay", DEFAULT_CMD_RETRY_DELAY, "seconds to wait before a process is restarted on failure")
 	flags.IntVar(&c.DiscoveryTimeout, "discovery-timeout", DEFAULT_DISCOVERY_TIMEOUT, "maximum seconds allowed for a VM discovery command")
 	flags.IntVar(&c.CapabilityProbeTimeout, "capability-probe-timeout", DEFAULT_CAPABILITY_PROBE_TIMEOUT, "maximum seconds allowed for a guest capability probe")
+	flags.StringVar(&c.MetricsListenAddress, "metrics-listen-address", DEFAULT_METRICS_LISTEN_ADDRESS, "address for Prometheus metrics (empty disables the endpoint)")
 	flags.StringVar(&c.CursorDir, "cursor-dir", DEFAULT_CURSOR_DIR, "directory used to persist journald cursors (empty disables persistence)")
 	flags.BoolVar(&c.SkipLXCs, "skip-lxcs", false, "do not monitor LXCs virtuals")
 	flags.BoolVar(&c.SkipPVE, "skip-pve", false, "do not monitor this PVE node")
@@ -242,6 +246,16 @@ func (c Config) Validate() error {
 	}
 	if c.CapabilityProbeTimeout <= 0 {
 		return errors.New("capability-probe-timeout must be greater than zero")
+	}
+	if c.MetricsListenAddress != "" {
+		_, port, err := net.SplitHostPort(c.MetricsListenAddress)
+		if err != nil {
+			return errors.New("metrics-listen-address must be a host:port address or empty")
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return errors.New("metrics-listen-address port must be between 1 and 65535")
+		}
 	}
 	return nil
 }

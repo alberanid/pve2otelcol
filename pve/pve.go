@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -76,6 +78,7 @@ type loggerShutdown func(context.Context, *ologgers.OLogger) error
 type vmDiscovery func() (VMs, error)
 
 var errMonitorExited = errors.New("monitoring process exited unexpectedly")
+var errJournalRecordTooLarge = errors.New("journal record exceeds 1 MiB limit")
 
 const loggerShutdownTimeout = 5 * time.Second
 const monitorCommandWaitDelay = 5 * time.Second
@@ -133,6 +136,9 @@ type Pve struct {
 	capabilitiesMu         sync.Mutex
 	journalctlCapabilities map[int]string
 	reconcileMu            sync.Mutex
+	metrics                *metrics
+	metricsEndpoint        *metricsEndpoint
+	listen                 func(string, string) (net.Listener, error)
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -158,6 +164,8 @@ func New(cfg *config.Config) *Pve {
 		cancel:                 cancel,
 		stopDone:               make(chan struct{}),
 		journalctlCapabilities: make(map[int]string),
+		metrics:                &metrics{},
+		listen:                 net.Listen,
 	}
 	pve.runMonitor = pve.RunKeptAliveProcess
 	pve.runProcess = pve.runVMMonitoring
@@ -189,6 +197,7 @@ func (p *Pve) shutdownLoggerWithTimeout(logger *ologgers.OLogger, source string)
 	ctx, cancel := context.WithTimeout(context.Background(), loggerShutdownTimeout)
 	defer cancel()
 	if err := p.shutdownLogger(ctx, logger); err != nil {
+		p.metrics.exporterShutdownFailures.Add(1)
 		slog.Error("unable to shut down OTLP logger", "source", source, "error", err)
 	}
 }
@@ -217,19 +226,37 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 		return fmt.Errorf("start monitoring command for %s/%d: %w", vm.Type, vm.Id, err)
 	}
 	seenError := false
-	scanner := bufio.NewScanner(stdout)
-	// journald fields can contain large payloads. Accept records up to 1 MiB,
-	// then fail the attempt instead of silently ending the stream.
-	// Scanner also needs room for the line delimiter beyond the record itself.
-	scanner.Buffer(make([]byte, initialJournalRecordBufferSize), maxJournalRecordSize+1)
-	for scanner.Scan() {
-		line := scanner.Text()
+	reader := bufio.NewReaderSize(stdout, initialJournalRecordBufferSize)
+	for {
+		line, readErr := readJournalRecord(reader)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			// A read failure can leave journalctl blocked on a full stdout pipe. Kill
+			// the process group before Wait so pct descendants cannot hold it open.
+			if errors.Is(readErr, errJournalRecordTooLarge) {
+				p.metrics.oversizedRecords.Add(1)
+				p.metrics.droppedRecords.Add(1)
+			}
+			cancelErr := cmd.Cancel()
+			_ = cmd.Wait()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			err := fmt.Errorf("read monitoring output of %s/%d: %w", vm.Type, vm.Id, readErr)
+			if cancelErr != nil && !errors.Is(cancelErr, os.ErrProcessDone) {
+				err = errors.Join(err, fmt.Errorf("terminate monitoring command: %w", cancelErr))
+			}
+			return withMonitorStderr(err, stderr)
+		}
 		var jData interface{}
 		err := json.Unmarshal([]byte(line), &jData)
 		if err != nil {
+			p.metrics.journalParseFailures.Add(1)
 			if !seenError {
-				slog.Warn(fmt.Sprintf("failure parsing JSON for %s/%d; some logs will be sent as strings: %s",
-					vm.Type, vm.Id, err))
+				slog.Warn("unable to parse journal JSON; forwarding malformed records as strings",
+					"source", vm.sourceID().String(), "error", err)
 				seenError = true
 			}
 			p.logRecord(vm.Logger, line)
@@ -237,20 +264,6 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 			p.logRecord(vm.Logger, jData)
 			p.advanceCursor(vm, jData)
 		}
-	}
-	if scanErr := scanner.Err(); scanErr != nil {
-		// A read failure can leave journalctl blocked on a full stdout pipe. Kill
-		// the process group before Wait so pct descendants cannot hold it open.
-		cancelErr := cmd.Cancel()
-		_ = cmd.Wait()
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		err := fmt.Errorf("read monitoring output of %s/%d: %w", vm.Type, vm.Id, scanErr)
-		if cancelErr != nil && !errors.Is(cancelErr, os.ErrProcessDone) {
-			err = errors.Join(err, fmt.Errorf("terminate monitoring command: %w", cancelErr))
-		}
-		return withMonitorStderr(err, stderr)
 	}
 	err = cmd.Wait()
 	if ctx.Err() != nil {
@@ -263,6 +276,47 @@ func (p *Pve) runVMMonitoring(ctx context.Context, vm *VM) error {
 		)
 	}
 	return nil
+}
+
+func readJournalRecord(reader *bufio.Reader) (string, error) {
+	record := make([]byte, 0, initialJournalRecordBufferSize)
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		total := len(record) + len(fragment)
+		endsWithNewline := len(fragment) > 0 && fragment[len(fragment)-1] == '\n'
+		if total > maxJournalRecordSize && !(total == maxJournalRecordSize+1 && endsWithNewline) {
+			return "", errJournalRecordTooLarge
+		}
+		record = append(record, fragment...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			if len(record) == maxJournalRecordSize {
+				next, nextErr := reader.ReadByte()
+				switch {
+				case errors.Is(nextErr, io.EOF):
+					return string(record), nil
+				case nextErr != nil:
+					return "", nextErr
+				case next == '\n':
+					return string(record), nil
+				default:
+					return "", errJournalRecordTooLarge
+				}
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", err
+		}
+		if errors.Is(err, io.EOF) && len(record) == 0 {
+			return "", io.EOF
+		}
+		record = bytes.TrimSuffix(record, []byte{'\n'})
+		record = bytes.TrimSuffix(record, []byte{'\r'})
+		if len(record) > maxJournalRecordSize {
+			return "", errJournalRecordTooLarge
+		}
+		return string(record), nil
+	}
 }
 
 func withMonitorStderr(err error, stderr *boundedBuffer) error {
@@ -279,9 +333,9 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 		return errors.New("missing monitoring command")
 	}
 	strCmd := monitorCommand(vm)
-	slog.Debug(fmt.Sprintf("run monitoring process '%s'", strCmd))
+	slog.Debug("run monitoring process", "source", vm.sourceID().String(), "command", strCmd)
 	if p.cfg.DryRun {
-		slog.Info(fmt.Sprintf("DRY RUN: %s", strCmd))
+		slog.Info("dry run: would run monitoring process", "source", vm.sourceID().String(), "command", strCmd)
 		return nil
 	}
 	attempts := 0
@@ -290,11 +344,13 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 		if attempts > 0 {
 			// the process failed to run: try again after a delay
 			if forever {
-				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d)",
-					strCmd, p.cfg.CmdRetryDelay, attempts), "error", lastErr)
+				slog.Warn("monitoring command failed; scheduling retry",
+					"source", vm.sourceID().String(), "command", strCmd, "retry", attempts,
+					"retry_delay_seconds", p.cfg.CmdRetryDelay, "retry_limit", "unbounded", "error", lastErr)
 			} else {
-				slog.Warn(fmt.Sprintf("command '%s' failed; trying again in %d second(s) (retry %d of %d)",
-					strCmd, p.cfg.CmdRetryDelay, attempts, p.cfg.CmdRetryTimes), "error", lastErr)
+				slog.Warn("monitoring command failed; scheduling retry",
+					"source", vm.sourceID().String(), "command", strCmd, "retry", attempts,
+					"retry_delay_seconds", p.cfg.CmdRetryDelay, "retry_limit", p.cfg.CmdRetryTimes, "error", lastErr)
 			}
 			timer := p.clock.NewTimer(time.Duration(p.cfg.CmdRetryDelay) * time.Second)
 			select {
@@ -310,6 +366,9 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 			}
 		}
 		attempts++
+		if attempts > 1 {
+			p.metrics.monitorRestarts.Add(1)
+		}
 		err := p.runProcess(ctx, vm)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -324,7 +383,8 @@ func (p *Pve) RunKeptAliveProcess(ctx context.Context, vm *VM, forever bool) err
 		if !forever && attempts > p.cfg.CmdRetryTimes {
 			terminalErr := fmt.Errorf("monitoring of %s/%d failed after %d attempt(s): %w",
 				vm.Type, vm.Id, attempts, err)
-			slog.Error(terminalErr.Error())
+			slog.Error("monitoring failed after retry exhaustion", "source", vm.sourceID().String(),
+				"attempts", attempts, "error", err)
 			return terminalErr
 		}
 	}
@@ -335,7 +395,7 @@ func monitorCommand(vm *VM) string {
 }
 
 func (p *Pve) logDryRunMonitor(vm *VM) {
-	slog.Info(fmt.Sprintf("DRY RUN: %s", monitorCommand(vm)))
+	slog.Info("dry run: would run monitoring process", "source", vm.sourceID().String(), "command", monitorCommand(vm))
 }
 
 func (p *Pve) startManagedMonitor(vm *VM, forever, self bool) bool {
@@ -357,6 +417,7 @@ func (p *Pve) startManagedMonitor(vm *VM, forever, self bool) bool {
 	vm.done = done
 	vm.lastError = nil
 	vm.stateMu.Unlock()
+	p.metrics.activeMonitors.Add(1)
 
 	if self {
 		p.selfVM = vm
@@ -371,6 +432,7 @@ func (p *Pve) startManagedMonitor(vm *VM, forever, self bool) bool {
 		vm.running = false
 		vm.stopping = false
 		vm.cancel = nil
+		p.metrics.activeMonitors.Add(-1)
 		close(done)
 		vm.done = nil
 		vm.stateMu.Unlock()
@@ -408,7 +470,7 @@ func (p *Pve) pveSelfMonitoring() error {
 	if err != nil {
 		hostname = "localhost"
 	}
-	slog.Debug(fmt.Sprintf("start PVE self-monitoring for node %s", hostname))
+	slog.Debug("start PVE self-monitoring", "node", hostname, "source", "pve/0")
 	vm := VM{
 		Id:         0,
 		Name:       hostname,
@@ -553,7 +615,7 @@ func (p *Pve) CurrentLXCs() (VMs, error) {
 				return nil, fmt.Errorf("probe lxc/%d for journalctl: %w", resource.VMID, err)
 			}
 			if !hasJournalctl {
-				slog.Debug(fmt.Sprintf("skipping lxc/%d: journalctl not found", resource.VMID))
+				slog.Debug("skip source because journalctl is unavailable", "source", sourceID("lxc", resource.VMID).String())
 				continue
 			}
 			p.cacheLXCJournalctl(resource.VMID, identity)
@@ -703,14 +765,14 @@ func (p *Pve) updateVMLocked(vm *VM) *VM {
 		ServiceId:   key.String(),
 	})
 	if err != nil {
-		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
+		slog.Warn("unable to create logger", "source", key.String(), "error", err)
 		p.shutdownLoggerWithTimeout(logger, fmt.Sprintf("%s/%d", vm.Type, vm.Id))
 		p.lifecycleMu.Unlock()
 		return nil
 	}
 	if logger == nil {
 		p.lifecycleMu.Unlock()
-		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d: logger factory returned nil", vm.Type, vm.Id))
+		slog.Warn("unable to create logger: factory returned nil", "source", key.String())
 		return nil
 	}
 	vm.Logger = logger
@@ -741,12 +803,12 @@ func (p *Pve) replaceRenamedVMLocked(key SourceID, existing, replacement *VM) *V
 		ServiceId:   key.String(),
 	})
 	if err != nil {
-		slog.Warn(fmt.Sprintf("unable to refresh logger metadata for %s", key))
+		slog.Warn("unable to refresh logger metadata", "source", key.String(), "error", err)
 		p.shutdownLoggerWithTimeout(logger, key.String())
 		return existing
 	}
 	if logger == nil {
-		slog.Warn(fmt.Sprintf("unable to refresh logger metadata for %s: logger factory returned nil", key))
+		slog.Warn("unable to refresh logger metadata: factory returned nil", "source", key.String())
 		return existing
 	}
 	replacement.Logger = logger
@@ -775,7 +837,7 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 	// ensure VM is known (and logger created) first
 	stored := p.UpdateVM(vm)
 	if stored != nil && stored.Logger != nil && p.startManagedMonitor(stored, false, false) {
-		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", stored.Type, stored.Id))
+		slog.Debug("start source monitoring", "source", stored.sourceID().String())
 	}
 }
 
@@ -788,7 +850,7 @@ func (p *Pve) StopVMMonitoring(key SourceID) {
 	if !ok {
 		return
 	}
-	slog.Debug(fmt.Sprintf("stop monitoring VM %s/%d", vm.Type, vm.Id))
+	slog.Debug("stop source monitoring", "source", key.String())
 	stopMonitor(vm, false)
 }
 
@@ -804,7 +866,7 @@ func (p *Pve) removeVMLocked(key SourceID) {
 	vm, ok := p.knownVMs[key]
 	p.knownVMsMu.RUnlock()
 
-	slog.Debug(fmt.Sprintf("remove VM %s", key))
+	slog.Debug("remove monitored source", "source", key.String())
 	if ok {
 		stopMonitor(vm, true)
 		p.shutdownVMLogger(vm)
@@ -840,6 +902,7 @@ func (p *Pve) RefreshVMsMonitoring() error {
 	for _, vm := range discovered {
 		p.StartVMMonitoring(vm)
 	}
+	p.metrics.discoveredSources.Store(int64(len(discovered)))
 
 	remove := []SourceID{}
 	p.knownVMsMu.RLock()
@@ -899,8 +962,12 @@ func (p *Pve) Start() error {
 		return errors.New("service is stopping")
 	}
 	slog.Info("start monitoring")
+	if err := p.startMetricsEndpoint(); err != nil {
+		return err
+	}
 	if !p.cfg.SkipPVE {
 		if err := p.pveSelfMonitoring(); err != nil {
+			p.stopMetricsEndpoint()
 			return err
 		}
 	}
@@ -993,5 +1060,6 @@ func (p *Pve) Stop() {
 	}
 	p.knownVMsMu.Unlock()
 
+	p.stopMetricsEndpoint()
 	close(stopDone)
 }

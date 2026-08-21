@@ -42,6 +42,26 @@ LXC discovery uses the local Proxmox API through `pvesh` and consumes its JSON o
 
 Monitored sources use a type-qualified identity such as `lxc/101`, keeping container and virtual-machine IDs distinct. Successful refreshes also reconcile names and monitoring commands. A renamed source receives a new OpenTelemetry logger provider so subsequent records carry the updated `service.name`; if that provider cannot be created, the existing monitor remains active and the rename is retried during a later refresh.
 
+### Metrics
+
+A Prometheus text endpoint listens on `127.0.0.1:9221` by default. Set `--metrics-listen-address host:port` to change it, or pass an empty value to disable it. Keep a non-loopback listener behind an appropriate firewall or authenticated reverse proxy.
+
+```sh
+curl --fail --silent http://127.0.0.1:9221/metrics
+```
+
+The endpoint exports:
+
+- `pve2otelcol_discovered_sources`, the size of the latest successful discovery snapshot;
+- `pve2otelcol_active_monitors`, including the PVE self-monitor when enabled;
+- `pve2otelcol_monitor_restarts_total`;
+- `pve2otelcol_journal_parse_failures_total`;
+- `pve2otelcol_oversized_records_total`;
+- `pve2otelcol_dropped_records_total`, currently records rejected before logger handoff because they exceed the 1 MiB safety limit; and
+- `pve2otelcol_exporter_shutdown_failures_total`.
+
+All service diagnostics use structured `slog` attributes such as `source`, `command`, `retry`, and `error`. The default text handler renders them as searchable `key=value` pairs in the systemd journal message.
+
 ### TLS
 
 Use an `https` endpoint to verify the collector with the host's system CA certificates:
@@ -70,7 +90,13 @@ If the collector requires mutual TLS, also provide the client identity certifica
 
 The certificate and key options must be supplied together, and all TLS file options require the selected gRPC or HTTP endpoint to use `https`.
 
-Journal cursors are checkpointed per source under `/var/lib/pve2otelcol/cursors` by default. When a monitoring command restarts, the saved cursor is passed to `journalctl --after-cursor`, so records written during the restart are replayed instead of skipped. Checkpoints advance only after a record has been handed to the OpenTelemetry logger; after an abrupt process or host failure, a short suffix may therefore be delivered more than once. Use `--cursor-dir` to select another state directory, or pass an empty value to disable persistence.
+### Delivery guarantees
+
+Journal cursors are checkpointed per source under `/var/lib/pve2otelcol/cursors` by default. When a monitoring command restarts, the saved cursor is passed to `journalctl --after-cursor`, so records written during the restart can be replayed instead of silently skipped. Use `--cursor-dir` to select another state directory, or pass an empty value to disable persistence.
+
+Delivery is best effort, not exactly once. A checkpoint advances after a record is handed to the in-process OpenTelemetry logger, not after the collector acknowledges it. Consequently, an abrupt process or host failure can lose records still buffered in memory. Conversely, a crash before the latest cursor checkpoint is persisted can replay a suffix and produce duplicates. Exporter queue pressure or a collector outage can also lose records according to the OpenTelemetry SDK's batching behavior. Graceful shutdown reduces this risk by stopping producers before flushing every logger provider, but cannot turn OTLP batching into durable storage.
+
+Malformed JSON records are forwarded as strings. Records larger than 1 MiB are rejected, counted as oversized and dropped, and cause that monitor attempt to restart. Monitor retries and cursor replay preserve ordering only within each individual journal source; there is no ordering guarantee across sources.
 
 Structured journal values retain their native OpenTelemetry type where one exists. Unsigned integers too large for OTLP's signed 64-bit integer type are preserved as exact decimal strings, JSON null is represented as the string `"null"`, and otherwise unsupported values retain their formatted text. Metadata such as timestamps, priority, PID, and command is derived only from correctly typed string fields; malformed fields remain in the body without producing OpenTelemetry type errors.
 
@@ -87,6 +113,56 @@ cp goodies/pve2otelcol.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable pve2otelcol.service
 systemctl start pve2otelcol.service
+```
+
+The service intentionally runs as root: `pvesh` must read the local Proxmox API state, `pct exec` must enter container namespaces, and host/container journals and the cursor state directory must be accessible. It also needs outbound access to the selected OTLP endpoint and permission to bind the configured metrics address. Do not replace `User=root` implicitly supplied by systemd with an unprivileged account unless that complete Proxmox access path has been independently tested.
+
+The supplied unit uses `Type=exec`, waits for `network-online.target`, and gives graceful shutdown 30 seconds before systemd applies `KillMode=mixed`. Its hardening protects home directories, system configuration, and kernel interfaces while deliberately retaining root capabilities, namespace and cgroup access, devices, and normal networking required by Proxmox tooling. Validate local edits before deployment:
+
+```sh
+systemd-analyze verify /etc/systemd/system/pve2otelcol.service
+systemd-analyze security pve2otelcol.service
+```
+
+On SIGINT or SIGTERM, periodic discovery stops, all monitor process groups are cancelled and awaited, cursor state is persisted, and logger providers are flushed concurrently with five-second per-provider deadlines. The metrics endpoint is shut down last. `TimeoutStopSec=30s` is the outer systemd bound for this sequence.
+
+### Troubleshooting
+
+Inspect service state and structured logs:
+
+```sh
+systemctl status pve2otelcol.service
+journalctl -u pve2otelcol.service --since '30 minutes ago' --no-pager
+journalctl -u pve2otelcol.service -f
+```
+
+Trigger immediate discovery without restarting, then inspect metrics:
+
+```sh
+systemctl kill --signal=SIGUSR1 pve2otelcol.service
+curl --fail --silent http://127.0.0.1:9221/metrics
+```
+
+Run the same discovery and capability checks used by the service. Replace `101` with a local running container ID:
+
+```sh
+pvesh get /cluster/resources --type vm --output-format json
+pct exec 101 -- sh -c 'command -v journalctl >/dev/null 2>&1 && printf yes || printf no'
+pct exec 101 -- journalctl --lines 1 --output json
+```
+
+Check cursor ownership and recent values without modifying them:
+
+```sh
+find /var/lib/pve2otelcol/cursors -maxdepth 1 -type f -printf '%M %u:%g %p\n'
+tail -n 1 /var/lib/pve2otelcol/cursors/*.cursor
+```
+
+For TLS failures, confirm that the selected endpoint uses `https`, the CA file contains the issuing CA rather than the client certificate, and the client certificate/key are supplied together. Test the server chain independently before restarting:
+
+```sh
+openssl s_client -connect collector.example:4317 -servername collector.example \
+  -CAfile /etc/pve2otelcol/collector-ca.pem </dev/null
 ```
 
 ## Alloy and Loki configuration

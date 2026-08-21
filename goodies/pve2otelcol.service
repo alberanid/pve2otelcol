@@ -1,14 +1,32 @@
 [Unit]
 Description=Send PVE logs to OpenTelemetry collector
-After=network.target
-Wants=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-Restart=on-failure
+Type=exec
 StateDirectory=pve2otelcol
 StateDirectoryMode=0750
 ExecStart=/usr/local/bin/pve2otelcol --otlp-grpc-url http://collector.address:4317
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
 KillMode=mixed
+UMask=0027
+
+# These settings preserve the root privileges, namespaces, cgroup access,
+# devices, and network families required by pvesh, pct exec, journald, and OTLP.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

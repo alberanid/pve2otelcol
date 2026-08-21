@@ -288,6 +288,9 @@ func TestStopVMMonitoringCancelsAndWaitsForMonitor(t *testing.T) {
 
 	p.StartVMMonitoring(&VM{Id: 101, Name: "test", Type: "lxc", MonitorCmd: "journalctl"})
 	call := waitForMonitorCall(t, runnerStub)
+	if got := p.Metrics().ActiveMonitors; got != 1 {
+		t.Fatalf("active monitor gauge = %d, want 1", got)
+	}
 	stopReturned := make(chan struct{})
 	go func() {
 		p.StopVMMonitoring(sourceID("lxc", 101))
@@ -327,6 +330,9 @@ func TestStopVMMonitoringCancelsAndWaitsForMonitor(t *testing.T) {
 	call.vm.stateMu.Unlock()
 	if running || stopping || cancel != nil {
 		t.Errorf("final monitor state = running:%t stopping:%t cancel:%v, want stopped", running, stopping, cancel)
+	}
+	if got := p.Metrics().ActiveMonitors; got != 0 {
+		t.Fatalf("active monitor gauge after stop = %d, want 0", got)
 	}
 }
 
@@ -467,6 +473,9 @@ func TestRetryExhaustionPublishesErrorAndAllowsRestart(t *testing.T) {
 	}
 	if !errors.Is(terminalErr, processError) {
 		t.Fatalf("restart terminal error = %v, want wrapped %v", terminalErr, processError)
+	}
+	if got := p.Metrics().MonitorRestarts; got != 4 {
+		t.Fatalf("monitor restart count = %d, want 4", got)
 	}
 }
 
@@ -1083,6 +1092,10 @@ func TestRunVMMonitoringRejectsRecordOverLimitAndTerminatesChild(t *testing.T) {
 	if got := logged.Load(); got != 0 {
 		t.Fatalf("records logged over the size limit = %d, want 0", got)
 	}
+	metrics := p.Metrics()
+	if metrics.OversizedRecords != 1 || metrics.DroppedRecords != 1 {
+		t.Fatalf("oversized/drop metrics = %d/%d, want 1/1", metrics.OversizedRecords, metrics.DroppedRecords)
+	}
 }
 
 func TestRunVMMonitoringFallsBackToStringForMalformedJSON(t *testing.T) {
@@ -1103,6 +1116,9 @@ func TestRunVMMonitoringFallsBackToStringForMalformedJSON(t *testing.T) {
 	}
 	if got, ok := captured.(string); !ok || got != "not-json" {
 		t.Fatalf("captured record = %#v, want malformed line as string", captured)
+	}
+	if got := p.Metrics().JournalParseFailures; got != 1 {
+		t.Fatalf("journal parse failure count = %d, want 1", got)
 	}
 }
 

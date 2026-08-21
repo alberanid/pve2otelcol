@@ -193,7 +193,7 @@ func (p *Pve) advanceCursor(vm *VM, record interface{}) {
 		return
 	}
 	if err := validateCursor(cursor); err != nil {
-		slog.Warn("ignoring invalid journal cursor", "source", fmt.Sprintf("%s/%d", vm.Type, vm.Id), "error", err)
+		slog.Warn("ignoring invalid journal cursor", "source", vm.sourceID().String(), "error", err)
 		return
 	}
 
@@ -223,7 +223,7 @@ func (p *Pve) persistCursor(vm *VM, force bool) {
 		err = p.cursorStore.Save(source, cursor)
 	}
 	if err != nil {
-		slog.Error("unable to persist journal cursor", "source", fmt.Sprintf("%s/%d", vm.Type, vm.Id), "error", err)
+		slog.Error("unable to persist journal cursor", "source", vm.sourceID().String(), "error", err)
 		return
 	}
 
