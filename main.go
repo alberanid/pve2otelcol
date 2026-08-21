@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,7 +19,10 @@ func main() {
 	signal.Notify(refreshSig, syscall.SIGUSR1)
 
 	p := pve.New(cfg)
-	p.Start()
+	if err := p.Start(); err != nil {
+		slog.Error("unable to start monitoring", "error", err)
+		os.Exit(1)
+	}
 
 	go func() {
 		<-stopSigs

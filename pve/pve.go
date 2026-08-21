@@ -36,22 +36,32 @@ type VM struct {
 // map of VMID to VM information
 type VMs map[int]*VM
 
+type loggerFactory func(*config.Config, ologgers.OLoggerOptions) (*ologgers.OLogger, error)
+
+type monitorLauncher func(*VM, bool)
+
 // object used to interact with a Proxmox instance
 type Pve struct {
-	cfg        *config.Config
-	knownVMs   VMs
-	knownVMsMu sync.RWMutex
-	ticker     *time.Ticker
-	quitTicker chan bool
+	cfg           *config.Config
+	knownVMs      VMs
+	knownVMsMu    sync.RWMutex
+	ticker        *time.Ticker
+	quitTicker    chan bool
+	newLogger     loggerFactory
+	launchMonitor monitorLauncher
 }
 
 // return a Pve instance.
 func New(cfg *config.Config) *Pve {
-	pve := Pve{
-		cfg:      cfg,
-		knownVMs: VMs{},
+	pve := &Pve{
+		cfg:       cfg,
+		knownVMs:  VMs{},
+		newLogger: ologgers.New,
 	}
-	return &pve
+	pve.launchMonitor = func(vm *VM, forever bool) {
+		go pve.RunKeptAliveProcess(vm, forever)
+	}
+	return pve
 }
 
 // execute the command to get and parse logs from a VM
@@ -140,7 +150,7 @@ func (p *Pve) RunKeptAliveProcess(vm *VM, forever bool) error {
 }
 
 // monitor Proxmox itself
-func (p *Pve) pveSelfMonitoring() {
+func (p *Pve) pveSelfMonitoring() error {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "localhost"
@@ -159,15 +169,19 @@ func (p *Pve) pveSelfMonitoring() {
 			"json",
 		},
 	}
-	logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
+	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
 		ServiceName: vm.Name,
 		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 	})
 	if err != nil {
-		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
+		return fmt.Errorf("create logger for %s/%d: %w", vm.Type, vm.Id, err)
+	}
+	if logger == nil {
+		return fmt.Errorf("create logger for %s/%d: logger factory returned nil", vm.Type, vm.Id)
 	}
 	vm.Logger = logger
-	go p.RunKeptAliveProcess(&vm, true)
+	p.launchMonitor(&vm, true)
+	return nil
 }
 
 // check whether journalctl is available inside an LXC container
@@ -317,7 +331,7 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 	}
 
 	// create logger without holding the map lock
-	logger, err := ologgers.New(p.cfg, ologgers.OLoggerOptions{
+	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
 		ServiceName: vm.Name,
 		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
 	})
@@ -349,7 +363,7 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 		slog.Debug(fmt.Sprintf("start monitoring VM %s/%d", stored.Type, stored.Id))
 		stored.Running = true
 		p.knownVMsMu.Unlock()
-		go p.RunKeptAliveProcess(stored, false)
+		p.launchMonitor(stored, false)
 		return
 	}
 	p.knownVMsMu.Unlock()
@@ -437,16 +451,19 @@ func (p *Pve) periodicRefresh() {
 }
 
 // start managing monitoring processes
-func (p *Pve) Start() {
+func (p *Pve) Start() error {
 	if p.ticker != nil {
 		// do nothing, if already running
-		return
+		return nil
 	}
 	slog.Info("start monitoring")
 	if !p.cfg.SkipPVE {
-		p.pveSelfMonitoring()
+		if err := p.pveSelfMonitoring(); err != nil {
+			return err
+		}
 	}
 	p.periodicRefresh()
+	return nil
 }
 
 // stop all running monitoring processes
