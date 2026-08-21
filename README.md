@@ -40,6 +40,8 @@ The URL for the selected exporter must include an explicit `http` or `https` sch
 
 LXC discovery uses the local Proxmox API through `pvesh` and consumes its JSON output. Discovery commands are limited to 10 seconds by default (`--discovery-timeout`), while guest `journalctl` capability probes are limited to 5 seconds (`--capability-probe-timeout`). A successful probe is reused on later refreshes until the discovered container identity changes; a missing capability is checked again so installing `journalctl` does not require restarting the service.
 
+Monitored sources use a type-qualified identity such as `lxc/101`, keeping container and virtual-machine IDs distinct. Successful refreshes also reconcile names and monitoring commands. A renamed source receives a new OpenTelemetry logger provider so subsequent records carry the updated `service.name`; if that provider cannot be created, the existing monitor remains active and the rename is retried during a later refresh.
+
 ### TLS
 
 Use an `https` endpoint to verify the collector with the host's system CA certificates:

@@ -121,7 +121,7 @@ func TestCurrentLXCsUsesJSONDiscoveryAndCachesSuccessfulProbe(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CurrentLXCs() attempt %d error = %v", attempt+1, err)
 		}
-		if vm := vms[201]; vm == nil || vm.Name != "name with spaces" {
+		if vm := vms[sourceID("lxc", 201)]; vm == nil || vm.Name != "name with spaces" {
 			t.Fatalf("CurrentLXCs() attempt %d VM = %#v", attempt+1, vm)
 		}
 	}

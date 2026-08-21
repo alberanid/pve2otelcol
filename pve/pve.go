@@ -45,8 +45,25 @@ type VM struct {
 	lastCursorPersistAttempt time.Time
 }
 
-// map of VMID to VM information
-type VMs map[int]*VM
+// SourceID is the stable identity of a monitored source, for example lxc/101.
+// Proxmox VMIDs are unique today, but including the source type prevents future
+// LXC/QEMU collisions and keeps ownership explicit throughout reconciliation.
+type SourceID string
+
+func sourceID(sourceType string, id int) SourceID {
+	return SourceID(fmt.Sprintf("%s/%d", sourceType, id))
+}
+
+func (vm *VM) sourceID() SourceID {
+	return sourceID(vm.Type, vm.Id)
+}
+
+func (id SourceID) String() string {
+	return string(id)
+}
+
+// map of stable source identity to VM information
+type VMs map[SourceID]*VM
 
 type loggerFactory func(*config.Config, ologgers.OLoggerOptions) (*ologgers.OLogger, error)
 
@@ -115,6 +132,7 @@ type Pve struct {
 	cursorStore            cursorStore
 	capabilitiesMu         sync.Mutex
 	journalctlCapabilities map[int]string
+	reconcileMu            sync.Mutex
 
 	serviceMu   sync.Mutex
 	started     bool
@@ -541,7 +559,7 @@ func (p *Pve) CurrentLXCs() (VMs, error) {
 			p.cacheLXCJournalctl(resource.VMID, identity)
 		}
 		strID := strconv.Itoa(resource.VMID)
-		vms[resource.VMID] = &VM{
+		vm := &VM{
 			Id:         resource.VMID,
 			Name:       resource.Name,
 			Type:       "lxc",
@@ -558,6 +576,7 @@ func (p *Pve) CurrentLXCs() (VMs, error) {
 				"json",
 			},
 		}
+		vms[vm.sourceID()] = vm
 	}
 	return vms, nil
 }
@@ -579,7 +598,7 @@ func (p *Pve) CurrentKVMs() (VMs, error) {
 			continue
 		}
 		strID := strconv.Itoa(resource.VMID)
-		vms[resource.VMID] = &VM{
+		vm := &VM{
 			Id:         resource.VMID,
 			Name:       resource.Name,
 			Type:       "qm",
@@ -596,6 +615,7 @@ func (p *Pve) CurrentKVMs() (VMs, error) {
 				"json",
 			},
 		}
+		vms[vm.sourceID()] = vm
 	}
 	return vms, nil
 }
@@ -627,12 +647,48 @@ func (p *Pve) CurrentVMs() (VMs, error) {
 
 // add the received VM to the list of known VMs, creating its logger service if needed
 func (p *Pve) UpdateVM(vm *VM) *VM {
-	// fast path: check if already present
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+	return p.updateVMLocked(vm)
+}
+
+func sameMonitorMetadata(current, discovered *VM) bool {
+	return current.Name == discovered.Name &&
+		current.MonitorCmd == discovered.MonitorCmd &&
+		slices.Equal(current.MonitorArgs, discovered.MonitorArgs)
+}
+
+func (p *Pve) updateVMLocked(vm *VM) *VM {
+	key := vm.sourceID()
 	p.knownVMsMu.RLock()
-	existing, ok := p.knownVMs[vm.Id]
+	existing, ok := p.knownVMs[key]
 	p.knownVMsMu.RUnlock()
 	if ok {
-		return existing
+		if sameMonitorMetadata(existing, vm) {
+			return existing
+		}
+		if existing.Name != vm.Name {
+			// The service name is OpenTelemetry resource metadata and cannot be
+			// mutated on an existing logger provider. Prepare a replacement before
+			// disturbing the active source, so exporter creation failure leaves the
+			// existing monitor intact for a later refresh to retry.
+			return p.replaceRenamedVMLocked(key, existing, vm)
+		} else {
+			// Command metadata is read by the monitor worker and retry loop. Stop
+			// them before updating it, retaining the logger and cursor state.
+			stopMonitor(existing, false)
+			existing.stateMu.Lock()
+			removed := existing.removed
+			if !removed {
+				existing.MonitorCmd = vm.MonitorCmd
+				existing.MonitorArgs = append([]string(nil), vm.MonitorArgs...)
+			}
+			existing.stateMu.Unlock()
+			if removed {
+				return nil
+			}
+			return existing
+		}
 	}
 
 	// Hold the lifecycle lock across logger creation and ownership transfer so
@@ -644,7 +700,7 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 	}
 	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
 		ServiceName: vm.Name,
-		ServiceId:   fmt.Sprintf("%s/%d", vm.Type, vm.Id),
+		ServiceId:   key.String(),
 	})
 	if err != nil {
 		slog.Warn(fmt.Sprintf("unable to create a logger for %s/%d", vm.Type, vm.Id))
@@ -660,16 +716,54 @@ func (p *Pve) UpdateVM(vm *VM) *VM {
 	vm.Logger = logger
 
 	p.knownVMsMu.Lock()
-	if existing, ok := p.knownVMs[vm.Id]; ok {
+	if existing, ok := p.knownVMs[key]; ok {
 		p.knownVMsMu.Unlock()
 		p.shutdownVMLogger(vm)
 		p.lifecycleMu.Unlock()
 		return existing
 	}
-	p.knownVMs[vm.Id] = vm
+	p.knownVMs[key] = vm
 	p.knownVMsMu.Unlock()
 	p.lifecycleMu.Unlock()
 	return vm
+}
+
+func (p *Pve) replaceRenamedVMLocked(key SourceID, existing, replacement *VM) *VM {
+	// Stop waits for lifecycleMu before collecting logger ownership, so holding
+	// it across creation and replacement prevents either logger from being lost.
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping {
+		return nil
+	}
+	logger, err := p.newLogger(p.cfg, ologgers.OLoggerOptions{
+		ServiceName: replacement.Name,
+		ServiceId:   key.String(),
+	})
+	if err != nil {
+		slog.Warn(fmt.Sprintf("unable to refresh logger metadata for %s", key))
+		p.shutdownLoggerWithTimeout(logger, key.String())
+		return existing
+	}
+	if logger == nil {
+		slog.Warn(fmt.Sprintf("unable to refresh logger metadata for %s: logger factory returned nil", key))
+		return existing
+	}
+	replacement.Logger = logger
+
+	stopMonitor(existing, true)
+	p.knownVMsMu.Lock()
+	current, ok := p.knownVMs[key]
+	if ok && current == existing {
+		p.knownVMs[key] = replacement
+	}
+	p.knownVMsMu.Unlock()
+	if !ok || current != existing {
+		p.shutdownVMLogger(replacement)
+		return current
+	}
+	p.shutdownVMLogger(existing)
+	return replacement
 }
 
 // run the monitoring process of a VM
@@ -686,10 +780,10 @@ func (p *Pve) StartVMMonitoring(vm *VM) {
 }
 
 // stop the monitoring process of a VM
-func (p *Pve) StopVMMonitoring(id int) {
+func (p *Pve) StopVMMonitoring(key SourceID) {
 	// obtain vm pointer under read lock, then operate without holding the lock
 	p.knownVMsMu.RLock()
-	vm, ok := p.knownVMs[id]
+	vm, ok := p.knownVMs[key]
 	p.knownVMsMu.RUnlock()
 	if !ok {
 		return
@@ -699,24 +793,26 @@ func (p *Pve) StopVMMonitoring(id int) {
 }
 
 // remove a VM from the list of known VMs
-func (p *Pve) RemoveVM(id int) {
+func (p *Pve) RemoveVM(key SourceID) {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+	p.removeVMLocked(key)
+}
+
+func (p *Pve) removeVMLocked(key SourceID) {
 	p.knownVMsMu.RLock()
-	vmDesc := fmt.Sprintf("%d", id)
-	vm, ok := p.knownVMs[id]
-	if ok {
-		vmDesc = fmt.Sprintf("%s/%d", vm.Type, id)
-	}
+	vm, ok := p.knownVMs[key]
 	p.knownVMsMu.RUnlock()
 
-	slog.Debug(fmt.Sprintf("remove VM %s", vmDesc))
+	slog.Debug(fmt.Sprintf("remove VM %s", key))
 	if ok {
 		stopMonitor(vm, true)
 		p.shutdownVMLogger(vm)
 	}
 
 	p.knownVMsMu.Lock()
-	if current, ok := p.knownVMs[id]; ok && current == vm {
-		delete(p.knownVMs, id)
+	if current, ok := p.knownVMs[key]; ok && current == vm {
+		delete(p.knownVMs, key)
 	}
 	p.knownVMsMu.Unlock()
 }
@@ -730,21 +826,32 @@ func (p *Pve) RefreshVMsMonitoring() error {
 	if err != nil {
 		return fmt.Errorf("discover current VMs: %w", err)
 	}
+	discovered := make(VMs, len(vms))
 	for _, vm := range vms {
+		if vm == nil {
+			return errors.New("discover current VMs: source has nil metadata")
+		}
+		key := vm.sourceID()
+		if _, duplicate := discovered[key]; duplicate {
+			return fmt.Errorf("discover current VMs: duplicate source %s", key)
+		}
+		discovered[key] = vm
+	}
+	for _, vm := range discovered {
 		p.StartVMMonitoring(vm)
 	}
 
-	remove := []int{}
+	remove := []SourceID{}
 	p.knownVMsMu.RLock()
-	for id, vm := range p.knownVMs {
-		if _, ok := vms[id]; !ok {
-			remove = append(remove, vm.Id)
+	for key := range p.knownVMs {
+		if _, ok := discovered[key]; !ok {
+			remove = append(remove, key)
 		}
 	}
 	p.knownVMsMu.RUnlock()
 
-	for _, id := range remove {
-		p.RemoveVM(id)
+	for _, key := range remove {
+		p.RemoveVM(key)
 	}
 	return nil
 }
@@ -827,11 +934,11 @@ func (p *Pve) Stop() {
 		p.quitTicker = nil
 	}
 
-	// collect ids first under lock to avoid holding lock while removing
-	ids := []int{}
+	// collect source identities first under lock to avoid holding lock while stopping
+	sources := []SourceID{}
 	p.knownVMsMu.RLock()
-	for id := range p.knownVMs {
-		ids = append(ids, id)
+	for source := range p.knownVMs {
+		sources = append(sources, source)
 	}
 	p.knownVMsMu.RUnlock()
 
@@ -840,14 +947,14 @@ func (p *Pve) Stop() {
 		done   <-chan struct{}
 		vm     *VM
 	}
-	pending := make([]pendingStop, 0, len(ids)+1)
+	pending := make([]pendingStop, 0, len(sources)+1)
 	if selfVM != nil {
 		cancel, done := requestMonitorStop(selfVM, true)
 		pending = append(pending, pendingStop{cancel: cancel, done: done, vm: selfVM})
 	}
-	for _, id := range ids {
+	for _, source := range sources {
 		p.knownVMsMu.RLock()
-		vm := p.knownVMs[id]
+		vm := p.knownVMs[source]
 		p.knownVMsMu.RUnlock()
 		if vm != nil {
 			cancel, done := requestMonitorStop(vm, true)
@@ -881,8 +988,8 @@ func (p *Pve) Stop() {
 	shutdownWG.Wait()
 
 	p.knownVMsMu.Lock()
-	for _, id := range ids {
-		delete(p.knownVMs, id)
+	for _, source := range sources {
+		delete(p.knownVMs, source)
 	}
 	p.knownVMsMu.Unlock()
 

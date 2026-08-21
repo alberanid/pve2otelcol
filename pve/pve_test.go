@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -289,7 +290,7 @@ func TestStopVMMonitoringCancelsAndWaitsForMonitor(t *testing.T) {
 	call := waitForMonitorCall(t, runnerStub)
 	stopReturned := make(chan struct{})
 	go func() {
-		p.StopVMMonitoring(101)
+		p.StopVMMonitoring(sourceID("lxc", 101))
 		close(stopReturned)
 	}()
 
@@ -417,7 +418,7 @@ func TestStopVMMonitoringInterruptsRetryDelay(t *testing.T) {
 
 	stopReturned := make(chan struct{})
 	go func() {
-		p.StopVMMonitoring(102)
+		p.StopVMMonitoring(sourceID("lxc", 102))
 		close(stopReturned)
 	}()
 	select {
@@ -446,7 +447,7 @@ func TestRetryExhaustionPublishesErrorAndAllowsRestart(t *testing.T) {
 
 	p.StartVMMonitoring(vm)
 	p.knownVMsMu.RLock()
-	stored := p.knownVMs[vm.Id]
+	stored := p.knownVMs[vm.sourceID()]
 	p.knownVMsMu.RUnlock()
 	terminalErr := waitForMonitorStopped(t, stored)
 	if got := attempts.Load(); got != 3 {
@@ -483,7 +484,7 @@ func TestNormalProcessExitIsRetryableFailure(t *testing.T) {
 
 	p.StartVMMonitoring(vm)
 	p.knownVMsMu.RLock()
-	stored := p.knownVMs[vm.Id]
+	stored := p.knownVMs[vm.sourceID()]
 	p.knownVMsMu.RUnlock()
 	terminalErr := waitForMonitorStopped(t, stored)
 	if got := attempts.Load(); got != 1 {
@@ -590,7 +591,7 @@ func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 	waitForMonitorCall(t, runnerStub)
 	removeReturned := make(chan struct{})
 	go func() {
-		p.RemoveVM(104)
+		p.RemoveVM(sourceID("lxc", 104))
 		close(removeReturned)
 	}()
 
@@ -600,7 +601,7 @@ func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 		t.Fatal("monitor did not receive cancellation")
 	}
 	p.knownVMsMu.RLock()
-	_, stillKnown := p.knownVMs[104]
+	_, stillKnown := p.knownVMs[sourceID("lxc", 104)]
 	p.knownVMsMu.RUnlock()
 	if !stillKnown {
 		t.Fatal("VM state was deleted before the monitor exited")
@@ -621,7 +622,7 @@ func TestRemoveVMWaitsBeforeDeletingMonitorState(t *testing.T) {
 		t.Fatal("RemoveVM did not return after the monitor exited")
 	}
 	p.knownVMsMu.RLock()
-	_, stillKnown = p.knownVMs[104]
+	_, stillKnown = p.knownVMs[sourceID("lxc", 104)]
 	p.knownVMsMu.RUnlock()
 	if stillKnown {
 		t.Fatal("VM state remains after monitor removal")
@@ -734,7 +735,7 @@ func TestRefreshDiscoveryFailurePreservesRunningMonitor(t *testing.T) {
 	}
 
 	p.knownVMsMu.RLock()
-	stored, ok := p.knownVMs[vm.Id]
+	stored, ok := p.knownVMs[vm.sourceID()]
 	p.knownVMsMu.RUnlock()
 	if !ok || stored != vm {
 		t.Fatal("discovery failure removed the existing monitor")
@@ -780,13 +781,197 @@ func TestRefreshSuccessfulEmptySnapshotRemovesMonitor(t *testing.T) {
 		t.Fatal("successful empty discovery did not cancel the monitor")
 	}
 	p.knownVMsMu.RLock()
-	_, ok := p.knownVMs[vm.Id]
+	_, ok := p.knownVMs[vm.sourceID()]
 	p.knownVMsMu.RUnlock()
 	if ok {
 		t.Fatal("successful empty discovery left the monitor tracked")
 	}
 	if got := shutdownSpy.count(vm.Logger); got != 1 {
 		t.Fatalf("logger shutdown count = %d, want 1", got)
+	}
+
+	p.Stop()
+}
+
+func TestStableSourceIdentityAllowsSameVMIDAcrossTypes(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	loggerStub.newLoggerFn = func(ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
+		return &ologgers.OLogger{}, nil
+	}
+
+	lxc := &VM{Id: 112, Name: "container", Type: "lxc", MonitorCmd: "pct"}
+	qemu := &VM{Id: 112, Name: "virtual-machine", Type: "qm", MonitorCmd: "qm"}
+	p.StartVMMonitoring(lxc)
+	p.StartVMMonitoring(qemu)
+	waitForMonitorCall(t, runnerStub)
+	waitForMonitorCall(t, runnerStub)
+
+	p.knownVMsMu.RLock()
+	storedLXC := p.knownVMs[sourceID("lxc", 112)]
+	storedQEMU := p.knownVMs[sourceID("qm", 112)]
+	knownCount := len(p.knownVMs)
+	p.knownVMsMu.RUnlock()
+	if knownCount != 2 || storedLXC != lxc || storedQEMU != qemu {
+		t.Fatalf("known sources = %#v, want independent lxc/112 and qm/112", p.knownVMs)
+	}
+	if len(loggerStub.options) != 2 || loggerStub.options[0].ServiceId != "lxc/112" || loggerStub.options[1].ServiceId != "qm/112" {
+		t.Fatalf("logger service IDs = %#v, want lxc/112 and qm/112", loggerStub.options)
+	}
+
+	p.Stop()
+}
+
+func TestRefreshNameChangeRecreatesResourceMetadata(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	createdLoggers := []*ologgers.OLogger{}
+	loggerStub.newLoggerFn = func(ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
+		logger := &ologgers.OLogger{}
+		createdLoggers = append(createdLoggers, logger)
+		return logger, nil
+	}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	original := &VM{Id: 113, Name: "old-name", Type: "lxc", MonitorCmd: "pct", MonitorArgs: []string{"old"}}
+	p.StartVMMonitoring(original)
+	waitForMonitorCall(t, runnerStub)
+	renamed := &VM{Id: 113, Name: "new-name", Type: "lxc", MonitorCmd: "pct", MonitorArgs: []string{"new"}}
+	p.discoverVMs = func() (VMs, error) {
+		return VMs{renamed.sourceID(): renamed}, nil
+	}
+
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		t.Fatalf("RefreshVMsMonitoring() error = %v", err)
+	}
+	call := waitForMonitorCall(t, runnerStub)
+	if call.vm != renamed {
+		t.Fatalf("restarted monitor VM = %#v, want renamed metadata", call.vm)
+	}
+	if loggerStub.calls != 2 || len(loggerStub.options) != 2 {
+		t.Fatalf("logger creations = %d, options = %d; want 2", loggerStub.calls, len(loggerStub.options))
+	}
+	if loggerStub.options[1].ServiceName != "new-name" || loggerStub.options[1].ServiceId != "lxc/113" {
+		t.Fatalf("replacement logger options = %#v", loggerStub.options[1])
+	}
+	if renamed.Logger == original.Logger || renamed.Logger != createdLoggers[1] {
+		t.Fatal("rename did not attach a newly created logger")
+	}
+	if got := shutdownSpy.count(createdLoggers[0]); got != 1 {
+		t.Fatalf("old logger shutdown count = %d, want 1", got)
+	}
+	p.knownVMsMu.RLock()
+	stored := p.knownVMs[renamed.sourceID()]
+	p.knownVMsMu.RUnlock()
+	if stored != renamed || stored.Name != "new-name" {
+		t.Fatalf("stored renamed source = %#v", stored)
+	}
+
+	p.Stop()
+}
+
+func TestRefreshNameChangeKeepsExistingMonitorWhenLoggerCreationFails(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	originalLogger := &ologgers.OLogger{}
+	loggerError := errors.New("exporter unavailable")
+	loggerStub.newLoggerFn = func(ologgers.OLoggerOptions) (*ologgers.OLogger, error) {
+		if loggerStub.calls == 1 {
+			return originalLogger, nil
+		}
+		return nil, loggerError
+	}
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+	monitorCanceled := make(chan struct{})
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		close(monitorCanceled)
+		return ctx.Err()
+	}
+
+	original := &VM{Id: 115, Name: "original", Type: "lxc", MonitorCmd: "pct"}
+	p.StartVMMonitoring(original)
+	waitForMonitorCall(t, runnerStub)
+	renamed := &VM{Id: 115, Name: "renamed", Type: "lxc", MonitorCmd: "pct"}
+	p.discoverVMs = func() (VMs, error) {
+		return VMs{renamed.sourceID(): renamed}, nil
+	}
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		t.Fatalf("RefreshVMsMonitoring() error = %v", err)
+	}
+
+	p.knownVMsMu.RLock()
+	stored := p.knownVMs[original.sourceID()]
+	p.knownVMsMu.RUnlock()
+	if stored != original || stored.Logger != originalLogger {
+		t.Fatalf("stored source after logger failure = %#v, want original", stored)
+	}
+	select {
+	case <-monitorCanceled:
+		t.Fatal("logger creation failure canceled the existing monitor")
+	default:
+	}
+	if got := shutdownSpy.count(originalLogger); got != 0 {
+		t.Fatalf("existing logger shutdown count = %d, want 0", got)
+	}
+	select {
+	case call := <-runnerStub.calls:
+		t.Fatalf("logger creation failure launched replacement monitor %#v", call.vm)
+	default:
+	}
+
+	p.Stop()
+}
+
+func TestRefreshCommandChangeRestartsMonitorWithoutReplacingLogger(t *testing.T) {
+	p, loggerStub, runnerStub := newTestPve(t)
+	logger := &ologgers.OLogger{}
+	loggerStub.logger = logger
+	shutdownSpy := newLoggerShutdownSpy()
+	p.shutdownLogger = shutdownSpy.shutdown
+	runnerStub.runFn = func(ctx context.Context, _ *VM, _ bool) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	original := &VM{Id: 114, Name: "same-name", Type: "lxc", MonitorCmd: "pct", MonitorArgs: []string{"old"}}
+	p.StartVMMonitoring(original)
+	waitForMonitorCall(t, runnerStub)
+	unchanged := &VM{Id: 114, Name: "same-name", Type: "lxc", MonitorCmd: "pct", MonitorArgs: []string{"old"}}
+	p.discoverVMs = func() (VMs, error) {
+		return VMs{unchanged.sourceID(): unchanged}, nil
+	}
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		t.Fatalf("unchanged RefreshVMsMonitoring() error = %v", err)
+	}
+	select {
+	case call := <-runnerStub.calls:
+		t.Fatalf("unchanged metadata restarted monitor for %#v", call.vm)
+	default:
+	}
+
+	changed := &VM{Id: 114, Name: "same-name", Type: "lxc", MonitorCmd: "new-monitor", MonitorArgs: []string{"new", "arguments"}}
+	p.discoverVMs = func() (VMs, error) {
+		return VMs{changed.sourceID(): changed}, nil
+	}
+	if err := p.RefreshVMsMonitoring(); err != nil {
+		t.Fatalf("changed RefreshVMsMonitoring() error = %v", err)
+	}
+	call := waitForMonitorCall(t, runnerStub)
+	if call.vm != original {
+		t.Fatalf("command refresh replaced VM state: got %p, want %p", call.vm, original)
+	}
+	if call.vm.MonitorCmd != "new-monitor" || !reflect.DeepEqual(call.vm.MonitorArgs, []string{"new", "arguments"}) {
+		t.Fatalf("refreshed command metadata = %q %q", call.vm.MonitorCmd, call.vm.MonitorArgs)
+	}
+	if loggerStub.calls != 1 || call.vm.Logger != logger {
+		t.Fatalf("logger was replaced for command-only change: calls=%d logger=%p", loggerStub.calls, call.vm.Logger)
+	}
+	if got := shutdownSpy.count(logger); got != 0 {
+		t.Fatalf("logger shutdown count during command refresh = %d, want 0", got)
 	}
 
 	p.Stop()
