@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -131,6 +134,9 @@ func TestParseArgsUsesDefaults(t *testing.T) {
 	if cfg.MetricsListenAddress != DEFAULT_METRICS_LISTEN_ADDRESS {
 		t.Errorf("metrics listen address = %q, want %q", cfg.MetricsListenAddress, DEFAULT_METRICS_LISTEN_ADDRESS)
 	}
+	if cfg.ConfigFile != DEFAULT_CONFIG_FILE {
+		t.Errorf("config file = %q, want %q", cfg.ConfigFile, DEFAULT_CONFIG_FILE)
+	}
 }
 
 func TestParseArgsUsesIndependentFlagSets(t *testing.T) {
@@ -148,6 +154,140 @@ func TestParseArgsUsesIndependentFlagSets(t *testing.T) {
 	if second.Verbose || len(second.MonitorInclude) != 0 {
 		t.Fatalf("second configuration leaked first parse state: %#v", second)
 	}
+}
+
+func TestParseArgsLoadsConfigFileAndCLIOverrides(t *testing.T) {
+	path := writeConfig(t, `
+[global]
+otlp-logger-name = file-logger
+otlp-grpc-url = https://file.example:4317
+otlp-tls-ca-file = /file/ca.pem
+otlp-compression = none
+otlp-initial-interval = 3
+otlp-max-interval = 12
+otlp-max-elapsed-time = 40
+otlp-timeout = 9000
+otlp-grpc-reconnection-period = 11
+otlp-batch-buffer-size = 2
+otlp-batch-export-interval = 4
+otlp-batch-max-batch-size = 256
+refresh-interval = 30
+cmd-retry-times = 8
+cmd-retry-delay = 6
+discovery-timeout = 20
+capability-probe-timeout = 7
+metrics-listen-address = 127.0.0.1:9999
+cursor-dir = /tmp/cursors
+skip-lxcs = true
+skip-pve = true
+dry-run = true
+verbose = true
+
+[vms]
+include = 101, 102
+exclude = 103
+`)
+
+	cfg, err := ParseArgs([]string{
+		"-config", path,
+		"-otlp-logger-name", "cli-logger",
+		"-refresh-interval", "15",
+		"-skip-lxcs=false",
+		"-monitor-include", "201,202",
+		"-monitor-exclude", "",
+	})
+	if err != nil {
+		t.Fatalf("ParseArgs() error = %v, want nil", err)
+	}
+	if cfg.ConfigFile != path || cfg.OtlpLoggerName != "cli-logger" || cfg.RefreshInterval != 15 || cfg.SkipLXCs {
+		t.Fatalf("CLI values did not override file values: %#v", cfg)
+	}
+	if cfg.OtlpCompression != "none" || cfg.OtlpTimeout != 9000 || !cfg.SkipPVE || !cfg.DryRun || !cfg.Verbose {
+		t.Fatalf("file values were not loaded: %#v", cfg)
+	}
+	if !reflect.DeepEqual(cfg.MonitorInclude, []int{201, 202}) || cfg.MonitorExclude != nil {
+		t.Fatalf("VM filters = include %v, exclude %v", cfg.MonitorInclude, cfg.MonitorExclude)
+	}
+}
+
+func TestParseArgsLoadsDefaultConfigWhenPresent(t *testing.T) {
+	path := writeConfig(t, "[global]\nverbose = true\n")
+	cfg, err := parseArgs(nil, path)
+	if err != nil {
+		t.Fatalf("parseArgs() error = %v, want nil", err)
+	}
+	if cfg.ConfigFile != path || !cfg.Verbose {
+		t.Fatalf("configuration = %#v, want loaded default file", cfg)
+	}
+}
+
+func TestParseArgsConfigFileErrors(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.conf")
+	if _, err := ParseArgs([]string{"-config", missing}); err == nil || !strings.Contains(err.Error(), "open config file") {
+		t.Fatalf("ParseArgs() error = %v, want missing config file error", err)
+	}
+	if _, err := parseArgs(nil, missing); err != nil {
+		t.Fatalf("parseArgs() error = %v, want optional default file to be ignored", err)
+	}
+
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"outside section", "verbose = true\n", "outside a section"},
+		{"unknown section", "[vm]\ninclude = 101\n", "unknown section"},
+		{"unknown setting", "[global]\nunknown = true\n", "unknown setting"},
+		{"invalid value", "[global]\notlp-timeout = soon\n", "invalid value"},
+		{"duplicate setting", "[vms]\ninclude = 101\ninclude = 102\n", "duplicate setting"},
+		{"overlapping filters", "[vms]\ninclude = 101\nexclude = 101\n", "present in both"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseArgs([]string{"-config", writeConfig(t, tt.content)})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ParseArgs() error = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSampleConfigCoversConfigurableOptions(t *testing.T) {
+	path := filepath.Join("..", "goodies", "pve2otelcol.conf")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseArgs([]string{"-config", path}); err != nil {
+		t.Fatalf("ParseArgs(sample) error = %v, want nil", err)
+	}
+
+	cfg := Config{}
+	var include string
+	var exclude string
+	flags := newFlagSet(&cfg, &include, &exclude)
+	flags.VisitAll(func(f *flag.Flag) {
+		if f.Name == "config" || f.Name == "version" || strings.HasPrefix(f.Name, "monitor-") {
+			return
+		}
+		if !strings.Contains(string(content), "\n"+f.Name+" =") {
+			t.Errorf("sample config does not contain %q", f.Name)
+		}
+	})
+	for _, setting := range []string{"\ninclude =", "\nexclude ="} {
+		if !strings.Contains(string(content), setting) {
+			t.Errorf("sample config does not contain %q", strings.TrimSpace(setting))
+		}
+	}
+}
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pve2otelcol.conf")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestParseArgsReturnsErrors(t *testing.T) {
@@ -222,7 +362,7 @@ func TestParseArgsHandlesHelpAndVersionWithoutExiting(t *testing.T) {
 func TestPrintUsage(t *testing.T) {
 	var output bytes.Buffer
 	PrintUsage(&output)
-	for _, want := range []string{"Usage: pve2otelcol [options]", "-otlp-exporter", "-otlp-tls-ca-file", "-refresh-interval", "-metrics-listen-address"} {
+	for _, want := range []string{"Usage: pve2otelcol [options]", "-config", "-otlp-exporter", "-otlp-tls-ca-file", "-refresh-interval", "-metrics-listen-address"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("usage does not contain %q:\n%s", want, output.String())
 		}

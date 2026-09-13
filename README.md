@@ -36,6 +36,24 @@ A popular collector is [Grafana Alloy](https://grafana.com/oss/alloy-opentelemet
 
 **pve2otelcol** has numerous other command line options, see `./pve2otelcol --help` for more information. The defaults should be reasonable values in most of the cases.
 
+### Configuration file
+
+The optional configuration file defaults to `/etc/pve2otelcol.conf`. Use `-config /path/to/file` to select another file. A missing default file is ignored; a missing explicitly selected file is an error. Command-line options override file settings.
+
+The file uses INI syntax. Global option names match their command-line names. VM IDs are comma-separated:
+
+```ini
+[global]
+otlp-grpc-url = http://collector.address:4317
+verbose = true
+
+[vms]
+include = 101, 102
+exclude = 109
+```
+
+See [`goodies/pve2otelcol.conf`](goodies/pve2otelcol.conf) for every supported setting. Per-VM settings are not supported.
+
 The URL for the selected exporter must include an explicit `http` or `https` scheme and a host. Invalid option values and inconsistent retry intervals are rejected before monitoring starts.
 
 LXC discovery uses the local Proxmox API through `pvesh` and consumes its JSON output. Discovery commands are limited to 10 seconds by default (`--discovery-timeout`), while guest `journalctl` capability probes are limited to 5 seconds (`--capability-probe-timeout`). A successful probe is reused on later refreshes until the discovered container identity changes; a missing capability is checked again so installing `journalctl` does not require restarting the service.
@@ -104,11 +122,12 @@ Structured journal values retain their native OpenTelemetry type where one exist
 
 To better integrate it with your PVE node, you can use the provided systemd unit file.
 
-A quick guide, to be run as root (do not forget to edit the pve2otelcol.service beforehand, to point it to your OpenTelemetry collector):
+A quick guide, to be run as root (edit the copied configuration to point to your OpenTelemetry collector):
 
 ```sh
 cp pve2otelcol /usr/local/bin/
 chmod 755 /usr/local/bin/pve2otelcol
+cp goodies/pve2otelcol.conf /etc/pve2otelcol.conf
 cp goodies/pve2otelcol.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable pve2otelcol.service

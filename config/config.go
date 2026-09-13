@@ -1,12 +1,14 @@
 package config
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,8 +34,9 @@ const DEFAULT_DISCOVERY_TIMEOUT = 10
 const DEFAULT_CAPABILITY_PROBE_TIMEOUT = 5
 const DEFAULT_METRICS_LISTEN_ADDRESS = "127.0.0.1:9221"
 const DEFAULT_CURSOR_DIR = "/var/lib/pve2otelcol/cursors"
+const DEFAULT_CONFIG_FILE = "/etc/pve2otelcol.conf"
 
-// store command line configuration.
+// Config stores runtime settings.
 type Config struct {
 	OtlpLoggerName             string
 	OtlpExporter               string
@@ -65,9 +68,10 @@ type Config struct {
 	MonitorInclude []int
 	MonitorExclude []int
 
-	DryRun  bool
-	Verbose bool
-	Version bool
+	ConfigFile string
+	DryRun     bool
+	Verbose    bool
+	Version    bool
 }
 
 // Split and trim comma-separated values.
@@ -88,6 +92,7 @@ func splitAndTrim(s string) ([]int, error) {
 func newFlagSet(c *Config, monitorInclude, monitorExclude *string) *flag.FlagSet {
 	flags := flag.NewFlagSet("pve2otelcol", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	flags.StringVar(&c.ConfigFile, "config", DEFAULT_CONFIG_FILE, "configuration file path")
 
 	flags.StringVar(&c.OtlpLoggerName, "otlp-logger-name", DEFAULT_OTLP_LOGGER_NAME, "OpenTelemetry logger name")
 	flags.StringVar(&c.OtlpExporter, "otlp-exporter", DEFAULT_OTLP_EXPORTER, "OpenTelemetry exporter (\"grpc\" or \"http\")")
@@ -140,33 +145,58 @@ func newFlagSet(c *Config, monitorInclude, monitorExclude *string) *flag.FlagSet
 
 // ParseArgs parses and validates command-line arguments without terminating the process.
 func ParseArgs(args []string) (Config, error) {
+	return parseArgs(args, DEFAULT_CONFIG_FILE)
+}
+
+func parseArgs(args []string, defaultConfigFile string) (Config, error) {
+	probe := Config{}
+	var probeInclude string
+	var probeExclude string
+	probeFlags := newFlagSet(&probe, &probeInclude, &probeExclude)
+	probe.ConfigFile = defaultConfigFile
+	if err := probeFlags.Parse(args); err != nil {
+		return probe, err
+	}
+	if probeFlags.NArg() != 0 {
+		return probe, fmt.Errorf("unexpected positional arguments: %s", strings.Join(probeFlags.Args(), " "))
+	}
+	if probe.Version {
+		return probe, nil
+	}
+	configExplicit := false
+	probeFlags.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			configExplicit = true
+		}
+	})
+
 	c := Config{}
 	var monitorInclude string
 	var monitorExclude string
 	flags := newFlagSet(&c, &monitorInclude, &monitorExclude)
+	c.ConfigFile = probe.ConfigFile
+	if err := loadFile(probe.ConfigFile, flags, configExplicit); err != nil {
+		return c, err
+	}
 	if err := flags.Parse(args); err != nil {
 		return c, err
 	}
 	if flags.NArg() != 0 {
 		return c, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	if c.Version {
-		return c, nil
-	}
-
 	if monitorInclude != "" {
-		ids, err := splitAndTrim(monitorInclude)
+		var err error
+		c.MonitorInclude, err = splitAndTrim(monitorInclude)
 		if err != nil {
 			return c, fmt.Errorf("parse monitor-include: %w", err)
 		}
-		c.MonitorInclude = ids
 	}
 	if monitorExclude != "" {
-		ids, err := splitAndTrim(monitorExclude)
+		var err error
+		c.MonitorExclude, err = splitAndTrim(monitorExclude)
 		if err != nil {
 			return c, fmt.Errorf("parse monitor-exclude: %w", err)
 		}
-		c.MonitorExclude = ids
 	}
 	for _, id := range c.MonitorInclude {
 		if slices.Contains(c.MonitorExclude, id) {
@@ -178,6 +208,75 @@ func ParseArgs(args []string) (Config, error) {
 		return c, err
 	}
 	return c, nil
+}
+
+func loadFile(path string, flags *flag.FlagSet, required bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && !required {
+			return nil
+		}
+		return fmt.Errorf("open config file %q: %w", path, err)
+	}
+	defer f.Close()
+
+	section := ""
+	seen := make(map[string]struct{})
+	scanner := bufio.NewScanner(f)
+	for lineNumber := 1; scanner.Scan(); lineNumber++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(line[1 : len(line)-1])
+			if section != "global" && section != "vms" {
+				return fmt.Errorf("parse config file %q line %d: unknown section %q", path, lineNumber, section)
+			}
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("parse config file %q line %d: expected key = value", path, lineNumber)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		flagName, err := configFlagName(section, key, flags)
+		if err != nil {
+			return fmt.Errorf("parse config file %q line %d: %w", path, lineNumber, err)
+		}
+		setting := section + "." + key
+		if _, ok := seen[setting]; ok {
+			return fmt.Errorf("parse config file %q line %d: duplicate setting %q", path, lineNumber, setting)
+		}
+		seen[setting] = struct{}{}
+		if err := flags.Set(flagName, value); err != nil {
+			return fmt.Errorf("parse config file %q line %d: invalid value for %s: %w", path, lineNumber, setting, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read config file %q: %w", path, err)
+	}
+	return nil
+}
+
+func configFlagName(section, key string, flags *flag.FlagSet) (string, error) {
+	switch section {
+	case "global":
+		if key == "config" || key == "version" || key == "monitor-include" || key == "monitor-exclude" {
+			break
+		}
+		if flags.Lookup(key) != nil {
+			return key, nil
+		}
+	case "vms":
+		if key == "include" || key == "exclude" {
+			return "monitor-" + key, nil
+		}
+	case "":
+		return "", errors.New("setting outside a section")
+	}
+	return "", fmt.Errorf("unknown setting %q in section %q", key, section)
 }
 
 // PrintUsage writes command-line usage without relying on the process-global FlagSet.
