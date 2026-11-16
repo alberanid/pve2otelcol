@@ -20,6 +20,7 @@ import (
 
 	"github.com/alberanid/pve2otelcol/config"
 	"github.com/alberanid/pve2otelcol/ologgers"
+	"github.com/alberanid/pve2otelcol/version"
 )
 
 // configuration used to monitor a VM
@@ -961,7 +962,7 @@ func (p *Pve) Start() error {
 	if stopping {
 		return errors.New("service is stopping")
 	}
-	slog.Info("start monitoring")
+	slog.Info("start monitoring", "version", version.VERSION)
 	if err := p.startMetricsEndpoint(); err != nil {
 		return err
 	}
